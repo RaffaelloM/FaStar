@@ -1,0 +1,44 @@
+# Build artifacts (regeneratable — never commit)
+build/
+build-*/
+__pycache__/
+*.pyc
+
+# Model files + sidecars + tokenizer (auto-downloaded from HuggingFace on first run)
+*.fst
+*.fst.*
+tokenizer.json
+main_*.bin
+
+# Quantizer shared lib (dead after MXFP4 migration)
+*.so
+
+# Logs and broken/dump junk
+*.log
+*.broken
+qc_mlir.txt
+
+# Compiled engine / standalone tool binaries (sources under src/, tools/ are tracked)
+/ds4_npu_engine
+/build/ds4_npu_engine
+tools/decode_insts
+tools/fused_ffn_probe
+tools/gen_insts
+tools/mc_gemm_probe
+tools/parse_insts
+tools/wqb_pack_probe
+fst_xclbin_inspect
+fst_npu_executor
+fst_gemm_probe
+
+# XRT runtime cache
+.xrt/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+
+# Cartelle nascoste e file di configurazione agenti
+.claude/
+AGENTS.md
+CLAUDE.md
