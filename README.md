@@ -14,6 +14,11 @@ budget via a paged expert cache.
 > **~0.05 tokens/sec** (see [Known limitations](#known-limitations)). The project's value is
 > the architecture — expert virtual memory + on-NPU MLA/FFN via IRON-generated kernels — and a
 > working end-to-end 284B inference path on consumer NPU hardware.
+>
+> 🆕 **Now also runs Tencent Hunyuan-3.0 (HY3)** — a 299B GQA + sigmoid-router + NextN-MTP
+> Mixture-of-Experts (~17B active), the opposite attention family from DeepSeek V4 Flash's MLA.
+> Decode is now **~0.14 tok/s** (OpenMP + AVX2/FMA-SIMD host attention). See the
+> [HY3 section](#hunyuan-30-hy3) below and the [HY3 model card](HY3_MODEL_CARD.md).
 
 ---
 
@@ -35,6 +40,76 @@ budget via a paged expert cache.
   are fetched automatically by CMake `FetchContent` on first configure.
 - **Auto model download.** On first run, if the model weights are missing, FaStar fetches them
   from HuggingFace (resumable) so a fresh clone is runnable with no manual setup.
+
+---
+
+## Hunyuan-3.0 (HY3)
+
+FaStar has been extended to run **Tencent Hunyuan-3.0** (`hy_v3`) — a 299B-parameter
+Mixture-of-Experts (~17B active per token) using **GQA + sigmoid router + NextN MTP**, the
+opposite attention family from DeepSeek V4 Flash's MLA. The same expert-virtual-memory
+architecture (SSD → RAM → NPU) runs it end-to-end on the Ryzen AI 9 365 NPU, with **zero
+mandatory new NPU kernels** — HY3 reuses the proven dequant/GEMM/`ew_unified`/router/`lm_head`
+xclbins (only the expert block size differs, read from the header) and **drops `mla_unified`**
+(GQA needs no latent compression), freeing ≥3 of the 9-hw_context cap.
+
+### HY3 architecture (from the GGUF metadata)
+
+| Hyperparameter | Value |
+|---|---|
+| Blocks | 81 (blk.0 dense L0 · blk.1–79 MoE · blk.80 NextN MTP) |
+| Hidden | 4096 |
+| Attention | GQA, 64 Q heads / 8 KV heads, head_dim 128, per-head Q/K RMSNorm |
+| Experts | 192 routed, top-8, + 1 always-on shared expert |
+| Expert / dense inter | 1536 / 13312 (L0) |
+| Router | sigmoid + per-expert bias (bias added to selection only); weight ÷ Σ × 2.826 |
+| RoPE | YaRN NeoX (base 11158840, factor 4.0, orig 262144 → 1 M context) |
+| Vocab | 120,832 (weight-tied LM head) |
+| `.fst` size | 173.82 GB (15,360 MXFP4 expert blocks, 10,027,008 B each, page-aligned) |
+
+### Running HY3
+
+```bash
+export XILINX_XRT=/usr
+# hy3.fst + tokenizer.json come from the HY3 HuggingFace repo (see HY3_MODEL_CARD.md)
+./build/ds4_npu_engine --model hy3.fst --prompt "Hello" --tokens 32 --temp 0.0
+#   -> "Hello! How can I help you today ..."
+```
+
+The HY3 path is selected automatically from the `.fst` header (`qh=64, kh=8, hd2=128`).
+Speculative decoding uses the **NextN MTP head** (block 80, shares the trunk embedding +
+LM head) rather than the separate DSpark draft model used for DeepSeek V4 Flash. The
+on-device expert FFN runs a fused 4-dispatch/layer path (`FST_HY3_FUSED_FFN`:
+dequant-8-experts + multicore gate/up/down GEMM + host SiLU/mul).
+
+### HY3 performance (measured on Ryzen AI 9 365)
+
+| | |
+|---|---|
+| Decode (coherent, M=16) | **~0.12 tok/s** |
+| Decode (raw M=1) | **~0.14 tok/s** |
+| Prefill (M=16 templated) | ~185 s |
+| Decode layer floor | ~89 ms (SSD ~50 ms · NPU FFN ~37 ms · host attn ~7 ms) |
+
+The dominant HY3 decode cost is **host GQA attention** (the 4 projection matvecs, ~55% of
+the layer at baseline). FaStar now parallelizes them with **OpenMP** (row-parallel,
+bit-identical) + **AVX2/FMA SIMD** (8-wide bf16→fp32 FMA inner loop, tree-reduce — not
+bit-identical, verified empirically to preserve the greedy argmax). This lifted decode
+from 0.07 → **0.14 tok/s raw (+100%) / 0.12 tok/s coherent (+71%)**; host attention is no
+longer the floor and SSD expert loading is back to the largest share.
+
+### HY3 model + model card
+
+The converted `hy3.fst` (173.82 GB) + `tokenizer.json` are self-contained — unlike the
+DeepSeek-V4-Flash-DSpark set, HY3 needs **no sidecar files** (its GQA + sigmoid router use
+no MLA/HC or hash-routing sidecars; RMSNorm weights live in the `.fst` shared bank). See
+**[HY3_MODEL_CARD.md](HY3_MODEL_CARD.md)** for the HuggingFace model card (Apache-2.0,
+inherited from `tencent/Hy3` via the `satgeze/Hy3-1M-GGUF` Q3_K_M source). Conversion is
+reproducible: `scripts/hy3_download.py` → `scripts/fst_converter.py hy3` → `scripts/verify_fst.py`.
+
+Full build notes (the converter, the HY3 engine path, the fused-FFN dispatch collapse,
+and the levers-1+3 / OpenMP / SIMD measurements) are in `HY3_PLAN.md`,
+`HY3_PIVOT_POSTMORTEM.md`, and `HY3_FUSED_FFN_POSTMORTEM.md`.
 
 ---
 

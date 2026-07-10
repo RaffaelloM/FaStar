@@ -14,6 +14,7 @@
 #include <random>
 #include <chrono>
 #include <cstring>
+#include <immintrin.h>
 #include <fstream>
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_bo.h"
@@ -25,6 +26,30 @@
 static double now(){return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 static inline float bf16f(bf16_t v){uint32_t b=(uint32_t)v<<16;float f;memcpy(&f,&b,4);return f;}
 static inline bf16_t f2bf(float f){uint32_t b;memcpy(&b,&f,4);return(bf16_t)(b>>16);}
+
+/* ── AVX2+FMA SIMD helpers for the host projection matvecs ────────────────
+ * bf16 is the top 16 bits of fp32, so bf16→fp32 = zero-extend u16→u32 then
+ * <<16 — bit-identical to bf16f() above.  The GEMM inner loop accumulates
+ * 8 elements/iter with _mm256_fmadd_ps (fused multiply-add) and a tree
+ * horizontal reduce.  This is NOT bit-identical to the serial k-loop (FMA +
+ * tree reduction change the rounding/order), but these helpers have no DS4
+ * caller (all HY3: attention q/k/v/o + dense + shared + NextN + host-FFN),
+ * so DS4 stays byte-identical; HY3 argmax-stability is verified empirically. */
+#if defined(__AVX2__) && defined(__FMA__)
+static inline __m256 bf16x8_to_f32x8(const bf16_t* p) {
+    __m128i v16 = _mm_loadu_si128((const __m128i*)p);          /* 8 bf16 */
+    __m256i v32 = _mm256_cvtepu16_epi32(v16);                  /* u16→u32 */
+    return _mm256_castsi256_ps(_mm256_slli_epi32(v32, 16));    /* <<16 = fp32 */
+}
+static inline float hsum256(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+#endif
 /* FP16 (IEEE half) → FP32 conversion.  Q8_0 scales are stored as FP16, NOT
  * BF16.  Interpreting them as BF16 (<<16) gives denormal garbage (1e-31). */
 static inline float fp16f(uint16_t h){
@@ -91,6 +116,180 @@ static void rms_cpu(bf16_t*o,const bf16_t*i,const bf16_t*w,int d,int n,float e=1
         float r=1.f/sqrtf(ss/(float)d+e);for(int j=0;j<d;j++)o[t*d+j]=f2bf(bf16f(i[t*d+j])*r*bf16f(w[j]));}}
 static void silu_cpu(bf16_t*o,const bf16_t*g,const bf16_t*u,int n){
     for(int i=0;i<n;i++){float x=bf16f(g[i]);o[i]=f2bf(0.5f*x*(1.f+tanhf(0.5f*x))*bf16f(u[i]));}}
+/* Host reference GEMM for ARCH_HY3 (correctness-first, pre-NPU).  B is stored
+ * native [N,K] row-major (= the .fst weight layout [out,in]), so out[m,n] =
+ * Σ_k bf16(A[m,k])·bf16(B[n,k]) accumulated in fp32.  A is [M,K], B is [N,K],
+ * out is [M,N].  fp32 output keeps q/k/v full precision through norm+RoPE. */
+static void host_gemm_bnk_f32(float* out, const bf16_t* A, const bf16_t* B,
+                              int M, int N, int K) {
+    for (int m = 0; m < M; m++) {
+        const bf16_t* arow = A + (size_t)m * K;
+        float* orow = out + (size_t)m * N;
+        /* Parallelize over output rows n (OpenMP) + vectorize the k-dot with
+         * AVX2+FMA (8 elems/iter).  Each n writes a distinct orow[n] so the
+         * OpenMP split is race-free; the SIMD accumulate is a tree reduction
+         * (NOT bit-identical to the serial k-loop — see bf16x8_to_f32x8), but
+         * this helper has no DS4 caller so DS4 stays byte-identical and the HY3
+         * argmax is verified empirically.  This is the HY3 decode floor: the
+         * q/k/v/o attention projections are M=1 matvecs (~107M MACs/layer). */
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; n++) {
+            const bf16_t* brow = B + (size_t)n * K;
+            float s;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 acc = _mm256_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= K; k += 8) {
+                __m256 af = bf16x8_to_f32x8(arow + k);
+                __m256 bf = bf16x8_to_f32x8(brow + k);
+                acc = _mm256_fmadd_ps(af, bf, acc);
+            }
+            s = hsum256(acc);
+            for (; k < K; k++) s += bf16f(arow[k]) * bf16f(brow[k]);   /* tail */
+#else
+            s = 0.0f;
+            for (int k = 0; k < K; k++) s += bf16f(arow[k]) * bf16f(brow[k]);
+#endif
+            orow[n] = s;
+        }
+    }
+}
+/* Same as host_gemm_bnk_f32 but A is fp32 (used by the o-projection, whose
+ * input is the fp32 attention output).  B is still native [N,K] bf16. */
+static void host_gemm_xnk_f32(float* out, const float* A, const bf16_t* B,
+                              int M, int N, int K) {
+    for (int m = 0; m < M; m++) {
+        const float* arow = A + (size_t)m * K;
+        float* orow = out + (size_t)m * N;
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; n++) {
+            const bf16_t* brow = B + (size_t)n * K;
+            float s;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 acc = _mm256_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= K; k += 8) {
+                __m256 af = _mm256_loadu_ps(arow + k);          /* A is fp32 */
+                __m256 bf = bf16x8_to_f32x8(brow + k);
+                acc = _mm256_fmadd_ps(af, bf, acc);
+            }
+            s = hsum256(acc);
+            for (; k < K; k++) s += arow[k] * bf16f(brow[k]);
+#else
+            s = 0.0f;
+            for (int k = 0; k < K; k++) s += arow[k] * bf16f(brow[k]);
+#endif
+            orow[n] = s;
+        }
+    }
+}
+/* Host fp32×fp32 GEMM for ARCH_HY3 routed-expert FFN (dequanted weights are
+ * fp32).  A is [M,K], B is [N,K] native row-major (= [out,in]); out[m,n]=Σ_k A[m,k]·B[n,k]. */
+static void host_gemm_f32f32(float* out, const float* A, const float* B,
+                             int M, int N, int K) {
+    for (int m = 0; m < M; m++) {
+        const float* arow = A + (size_t)m * K;
+        float* orow = out + (size_t)m * N;
+        #pragma omp parallel for schedule(static)
+        for (int n = 0; n < N; n++) {
+            const float* brow = B + (size_t)n * K;
+            float s;
+#if defined(__AVX2__) && defined(__FMA__)
+            __m256 acc = _mm256_setzero_ps();
+            int k = 0;
+            for (; k + 8 <= K; k += 8) {
+                __m256 af = _mm256_loadu_ps(arow + k);
+                __m256 bf = _mm256_loadu_ps(brow + k);
+                acc = _mm256_fmadd_ps(af, bf, acc);
+            }
+            s = hsum256(acc);
+            for (; k < K; k++) s += arow[k] * brow[k];
+#else
+            s = 0.0f;
+            for (int k = 0; k < K; k++) s += arow[k] * brow[k];
+#endif
+            orow[n] = s;
+        }
+    }
+}
+
+/* ── Host MXFP4 dense-block dequant (ARCH_HY3 expert bank) ─────────────────
+ * Inverse of fst_converter.py::_float32_to_dense_blocks.  Each 17-byte block
+ * = 1 e8m0 scale byte + 16 nibble bytes (32 FP4 elements, low nibble first):
+ *   element[i] = FP4_TABLE[nibble_i] × 2^(e8m0-127)   (e8m0=0 ⇒ dead block ⇒ 0)
+ * Blocks group 32 consecutive elements along the IN dim: block (row r, group g)
+ * covers in-elems [g*32, g*32+32).  packed is the expert-bank tensor slice;
+ * out is fp32 [out_dim, in_dim] row-major. */
+static const float FP4_TABLE[16] = {0.0f,0.5f,1.0f,1.5f,2.0f,3.0f,4.0f,6.0f,
+                                   0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f};
+static void dequant_mxfp4_dense(float* out, const uint8_t* packed,
+                                int out_dim, int in_dim) {
+    const int groups = in_dim / 32;
+    for (int r = 0; r < out_dim; r++) {
+        float* orow = out + (size_t)r * in_dim;
+        for (int g = 0; g < groups; g++) {
+            const uint8_t* blk = packed + (size_t)(r * groups + g) * 17;
+            uint8_t sc = blk[0];
+            float scale = (sc == 0) ? 0.0f : std::ldexp(1.0f, (int)sc - 127);
+            const uint8_t* nb = blk + 1;
+            for (int i = 0; i < 32; i++) {
+                uint8_t byte = nb[i >> 1];
+                uint8_t nib = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                orow[g * 32 + i] = FP4_TABLE[nib] * scale;
+            }
+        }
+    }
+}
+
+/* HY3 sigmoid+bias router (host; the 192-wide GEMM is tiny vs the expert FFN).
+ * router_w is [hd, n_experts]=[K,N] (transposed at load, matches router_gemm).
+ * Selection score = sigmoid(logit)+bias (top-k); weight = UNBIASED sigmoid of
+ * the winners, normalized ÷Σ then × ew_scale (HY3 gotcha: bias is selection-only). */
+static void hy3_router_host(int* eids, float* wts, const bf16_t* hidden,
+                            const float* router_w, const float* router_bias,
+                            int M, int n_experts, int top_k, int hd, float ew_scale) {
+    std::vector<float> s(n_experts);
+    std::vector<int> ord(n_experts);
+    for (int m = 0; m < M; m++) {
+        const bf16_t* hm = hidden + (size_t)m * hd;
+        for (int n = 0; n < n_experts; n++) {
+            float l = 0.0f;
+            for (int k = 0; k < hd; k++) l += bf16f(hm[k]) * router_w[(size_t)k * n_experts + n];
+            s[n] = 1.0f / (1.0f + std::exp(-l));   /* sigmoid */
+        }
+        for (int i = 0; i < n_experts; i++) ord[i] = i;
+        std::partial_sort(ord.begin(), ord.begin() + top_k, ord.end(), [&](int a, int b){
+            float sa = s[a] + (router_bias ? router_bias[a] : 0.0f);
+            float sb = s[b] + (router_bias ? router_bias[b] : 0.0f);
+            return sa > sb;
+        });
+        float sum = 0.0f;
+        for (int k = 0; k < top_k; k++) { eids[m * top_k + k] = ord[k]; wts[m * top_k + k] = s[ord[k]]; sum += s[ord[k]]; }
+        float inv = ew_scale / (sum + 1e-12f);
+        for (int k = 0; k < top_k; k++) wts[m * top_k + k] *= inv;
+    }
+}
+
+/* SwiGLU on BF16 weights (dense L0 + always-on shared expert): out[M,hd] = down(SiLU(gate·h)·up·h).
+ * gate/up are [inter,hd] native; down is [hd,inter] native.  WRITES out (caller adds). */
+static void swiglu_bf16_host(const bf16_t* h, const bf16_t* gate, const bf16_t* up,
+                             const bf16_t* down, int M, int hd, int inter, float* out) {
+    std::vector<float> g((size_t)M * inter), u((size_t)M * inter), s((size_t)M * inter);
+    host_gemm_bnk_f32(g.data(), h, gate, M, inter, hd);
+    host_gemm_bnk_f32(u.data(), h, up,   M, inter, hd);
+    for (size_t i = 0; i < (size_t)M * inter; i++) { float gv = g[i]; s[i] = (gv / (1.0f + std::exp(-gv))) * u[i]; }
+    host_gemm_xnk_f32(out, s.data(), down, M, hd, inter);
+}
+/* SwiGLU on fp32 dequanted weights (routed experts): h_f is [M,hd] fp32;
+ * gate/up [inter,hd], down [hd,inter], all fp32 dequanted.  WRITES out. */
+static void swiglu_f32_host(const float* hf, const float* gate, const float* up,
+                            const float* down, int M, int hd, int inter, float* out) {
+    std::vector<float> g((size_t)M * inter), u((size_t)M * inter), s((size_t)M * inter);
+    host_gemm_f32f32(g.data(), hf, gate, M, inter, hd);
+    host_gemm_f32f32(u.data(), hf, up,   M, inter, hd);
+    for (size_t i = 0; i < (size_t)M * inter; i++) { float gv = g[i]; s[i] = (gv / (1.0f + std::exp(-gv))) * u[i]; }
+    host_gemm_f32f32(out, s.data(), down, M, hd, inter);
+}
 static void router_cpu(int*ids,float*wts,const bf16_t*hn,const float*rw,int M,int ne,int tk,int hd){
     for(int m=0;m<M;m++){std::vector<float> lg(ne);
         for(int e=0;e<ne;e++){float s=0;for(int d=0;d<hd;d++)s+=bf16f(hn[m*hd+d])*rw[e*hd+d];
@@ -1294,6 +1493,34 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
             config_.n_experts  = (int)eh->ne;
             config_.top_k      = (int)eh->tk;
             config_.expert_block_bytes = (size_t)eh->eb;
+            /* Detect Hunyuan-3.0 (HY3): GQA 64 Q / 8 KV @ head_dim 128 — the
+             * opposite attention family from DS4's MLA.  Done here (before
+             * kernel registration) so the MLA xclbins can be skipped on the
+             * HY3 path, freeing hw_contexts.  HY3 constants are unpacked from
+             * the reserved r1/r2 slots (no header struct change):
+             *   r1 low16  = first_k_dense_replace, r1 high16 = expert_gating_func
+             *   r2 high32 = int(yarn_factor*1000),  r2 low32  = int(ew_scale*1e6) */
+            if (eh->qh == 64 && eh->kh == 8 && eh->hd2 == 128) {
+                config_.arch = ARCH_HY3;
+                config_.num_q_heads  = (int)eh->qh;        /* 64 */
+                config_.num_kv_heads = (int)eh->kh;        /* 8  */
+                config_.head_dim    = (int)eh->hd2;        /* 128 */
+                config_.expert_inter_dim = (int)eh->id;   /* 1536 */
+                config_.rope_dim    = config_.head_dim;   /* rotate the full head_dim (rotate-half) */
+                config_.first_k_dense_replace = (int)(eh->r1 & 0xFFFFu);         /* 1 */
+                config_.expert_gating_func    = (int)((eh->r1 >> 16) & 0xFFFFu); /* 2 = sigmoid */
+                config_.rope_scaling_factor =
+                    (float)((eh->r2 >> 32) & 0xFFFFFFFFu) / 1000.0f;             /* 4.0 YaRN */
+                config_.expert_weights_scale =
+                    (float)(eh->r2 & 0xFFFFFFFFu) / 1e6f;                      /* 2.826 */
+                config_.yarn_orig_ctx = 262144;
+                fprintf(stderr, "[arch] HY3 (Hunyuan-3.0): %d layers, GQA %d/%d @ %d, "
+                        "%d experts top-%d, dense L0..%d, sigmoid router, ew_scale=%.4f, "
+                        "yarn=%.2f\n", config_.n_layers, config_.num_q_heads,
+                        config_.num_kv_heads, config_.head_dim, config_.n_experts,
+                        config_.top_k, config_.first_k_dense_replace,
+                        config_.expert_weights_scale, config_.rope_scaling_factor);
+            }
             ::close(efd);
         }
     }
@@ -1304,7 +1531,33 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // gemm/gemm2/gemm_down.  Same context count (2 FFN-GEMM ctxs).  silu_b/mul_b
     // ride the existing ew_unified xclbin (+0 ctx).  Default keeps the 0.06 baseline.
     const bool mc_ffn = std::getenv("FST_MC_FFN") != nullptr;
-    if (mc_ffn) {
+    /* Expert BO-cache cap: DS4 fits all 1376 experts in 20 GB; HY3 has 15,360
+     * experts (153 GB) and runs under a 35 GB cgroup, so default to 8 GB
+     * (≈800 experts, an LRU window — misses re-load from SSD).  Env-overridable. */
+    expert_bo_cap_ = (config_.arch == ARCH_HY3) ? (8ULL << 30) : (20ULL << 30);
+    if (const char* e = std::getenv("FST_EXPERT_BO_CAP_GB"))
+        expert_bo_cap_ = (size_t)std::atol(e) << 30;
+    // HY3 dispatch-collapse (FST_HY3_FUSED_FFN): pack ≤8 experts into one 80 MB
+    // MXFP4 BO, dequant all 8 in ONE dispatch, then 5 batched MC dispatches
+    // (gate/up/silu/mul/down, 8 cores 1 expert/core) = 6 dispatches/layer vs 48.
+    // Reuses the proven expert_gemm_mc_op (DS4 MC, cos 0.9988) at HY3 shapes.
+    hy3_fused_ffn_ = (config_.arch == ARCH_HY3) && (std::getenv("FST_HY3_FUSED_FFN") != nullptr);
+    if (config_.arch == ARCH_HY3) {
+        if (hy3_fused_ffn_) {
+            // 8-expert batched MC kernels (gate/up share hy3_gemm_vec_mc_8exp;
+            // down is its own xclbin).  3 FFN ctxs + ew_unified = 4 total (< 9).
+            kernel_cache_->register_kernel("hy3_gemm_mc",      "fst_hy3_gemm_vec_mc_8exp_insts.bin",  "fst_hy3_gemm_vec_mc_8exp.xclbin");
+            kernel_cache_->register_kernel("hy3_gemm_down_mc", "fst_hy3_gemm_down_8exp_insts.bin",   "fst_hy3_gemm_down_8exp.xclbin");
+        } else {
+            // HY3 FFN: expert inter_dim=1536 (DS4 kernels are baked to inter=2048 and
+            // CANNOT be reused — N=1536 vs 2048 for gate/up, K=1536 vs 2048 for down).
+            // gate/up : A[M,4096] @ B[4096,1536] -> C[M,1536]   (m16k128n32 b_col_maj)
+            // down    : A[M,1536] @ B[1536,4096] -> C[M,4096]   (m16k128n64 b_col_maj)
+            kernel_cache_->register_kernel("hy3_gemm",      "fst_hy3_gemm_vec_insts.bin",  "fst_hy3_gemm_vec.xclbin");
+            kernel_cache_->register_kernel("hy3_gemm2",      "fst_hy3_gemm_vec_insts.bin",  "fst_hy3_gemm_vec.xclbin");
+            kernel_cache_->register_kernel("hy3_gemm_down", "fst_hy3_gemm_down_insts.bin", "fst_hy3_gemm_down.xclbin");
+        }
+    } else if (mc_ffn) {
         kernel_cache_->register_kernel("gemm_mc",     "fst_expert_gemm_vec_mc_insts.bin",  "fst_expert_gemm_vec_mc.xclbin");
         kernel_cache_->register_kernel("gemm_down_mc","fst_expert_gemm_down_mc_insts.bin","fst_expert_gemm_down_mc.xclbin");
     } else {
@@ -1322,6 +1575,11 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // zero-padded to 512, 4x waste on small K/N, 1 shared context); qc/oa/kvc
     // share the (32,4096,1024) b_col_maj xclbin (kvc N-pads 512->1024, 2x waste).
     // NO scalar kernel, NO CPU fallback — MLA is fully vectorized aie::mmul.
+    //
+    // HY3 (ARCH_HY3) is GQA — it reuses expert_gemm_vec + ew_unified for q/k/v/o
+    // and DROPS the whole MLA context set (qc/wqb/ob/qksv/qck), so it stays at
+    // ~4 hw_contexts and frees ≥3 of the 9-cap for a later fused-FFN xclbin.
+    if (config_.arch == ARCH_DS4) {
     kernel_cache_->register_kernel("qc",   "fst_mla_qc_insts.bin",   "fst_mla_qc.xclbin");
     kernel_cache_->register_kernel("wqb",  "fst_mla_wqb_insts.bin",  "fst_mla_wqb.xclbin");
     kernel_cache_->register_kernel("ob",   "fst_mla_ob_insts.bin",   "fst_mla_ob.xclbin");
@@ -1331,8 +1589,21 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // no readback).  Used by the MLA projections via npu_gemm_mla_vec("qck").
     // HC stays on the "qc" xclbin (npu_gemm_hc, K_c=1024) -- separate context.
     kernel_cache_->register_kernel("qck",  "fst_mla_qck_insts.bin",  "fst_mla_qck.xclbin");
-    // Context 4: dequant (MXFP4: 17 bytes/block → 32 BF16, emits B[N,K] row-major)
-    kernel_cache_->register_kernel("dequant",    "fst_dequant_v4_insts.bin",         "fst_dequant_v4.xclbin");
+    } /* ARCH_DS4 MLA kernels */
+    // Context 4: dequant (MXFP4: 17 bytes/block → 32 BF16, emits B[N,K] row-major).
+    // HY3 experts are 10,027,008 B (589,824 blocks = 3*196,608) vs DS4's
+    // 13,369,344 B (786,432 blocks); the DS4 dequant is baked to 786,432 and would
+    // OVERRUN an HY3 expert BO, so HY3 uses its own 589,824-block dequant.
+    if (config_.arch == ARCH_HY3) {
+        kernel_cache_->register_kernel("hy3_dequant", "fst_hy3_dequant_insts.bin", "fst_hy3_dequant.xclbin");
+        if (hy3_fused_ffn_)
+            // 8-expert packed dequant (variant, currently UNUSED — the per-slot
+            // dequant in process_expert_ffn_hy3_fused avoids its 80 MB pack+sync,
+            // which measured 4.5× slower than 8 pipelined per-expert dequants).
+            // Kept registered for A/B comparison.
+            kernel_cache_->register_kernel("hy3_dequant_8exp", "fst_hy3_dequant_8exp_insts.bin", "fst_hy3_dequant_8exp.xclbin");
+    } else
+        kernel_cache_->register_kernel("dequant",    "fst_dequant_v4_insts.bin",         "fst_dequant_v4.xclbin");
     // Context 5: ew_unified -- 7 kernels sharing ONE xclbin / ONE hw_context:
     //   rmsnorm, silu, mul, softmax, rope, router_gemm, lm_head_gemm
     kernel_cache_->register_kernel("rmsnorm",      "fst_ew_rmsnorm_insts.bin",      "fst_ew_unified.xclbin");
@@ -1367,6 +1638,59 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     {double ts0=now(); load_shared_weights(fst_path);
      fprintf(stderr,"[time] load_shared_weights %.2fs\n", now()-ts0); fflush(stderr);}
 
+    /* FST_HY3_LOAD_ONLY: stop right after the HY3 weight load (before any
+     * NPU scratch-BO alloc / preload / generation) — used to verify the
+     * arch detection + TID-based loader end-to-end without the (unwired yet)
+     * GQA/MTP inference path.  Prints a per-tensor sanity summary. */
+    if (config_.arch == ARCH_HY3 && std::getenv("FST_HY3_LOAD_ONLY")) {
+        const auto& w0 = hy3_shared_[0];
+        const auto& wl = hy3_shared_[config_.n_layers - 1];
+        fprintf(stderr, "[hy3-verify] arch=HY3 layers=%d hidden=%d GQA %d/%d@%d "
+                "experts=%d topk=%d dense0..%d inter_dense=%d expert_inter=%d "
+                "ew_scale=%.4f yarn=%.2f\n", config_.n_layers, config_.hidden_dim,
+                config_.num_q_heads, config_.num_kv_heads, config_.head_dim,
+                config_.n_experts, config_.top_k, config_.first_k_dense_replace,
+                config_.dense_inter_dim, config_.expert_inter_dim,
+                config_.expert_weights_scale, config_.rope_scaling_factor);
+        fprintf(stderr, "[hy3-verify] L0   dense_gate=%zu (expect %d) "
+                "q_proj=%zu (expect %d) router(empty L0)=%zu\n",
+                w0.dense_gate.size(), config_.dense_inter_dim*config_.hidden_dim,
+                w0.q_proj.size(), config_.num_q_heads*config_.head_dim*config_.hidden_dim,
+                w0.router.size());
+        fprintf(stderr, "[hy3-verify] L1   router=%zu (expect %d, transposed) "
+                "router_bias=%zu shared_gate=%zu\n",
+                hy3_shared_[1].router.size(),
+                config_.hidden_dim*config_.n_experts,
+                hy3_shared_[1].router_bias.size(),
+                hy3_shared_[1].shared_gate.size());
+        fprintf(stderr, "[hy3-verify] L80  nextn_eh_proj=%zu (expect %d) "
+                "enorm=%zu shared_head_norm=%zu router=%zu\n",
+                wl.nextn_eh_proj.size(), config_.hidden_dim*2*config_.hidden_dim,
+                wl.nextn_enorm.size(), wl.nextn_shared_head_norm.size(),
+                wl.router.size());
+        fprintf(stderr, "[hy3-verify] embed=%zu lm_head=%zu final_norm=%zu elems "
+                "(expect %d / %d / %d)\n", host_embedding_table_.size(),
+                host_lm_head_.size(), model_.final_norm_bytes/sizeof(bf16_t),
+                config_.vocab_size*config_.hidden_dim,
+                config_.vocab_size*config_.hidden_dim, config_.hidden_dim);
+        /* spot-check finite values on L1 q_proj + router + embed row 0 */
+        auto fin = [](const bf16_t* v, size_t n){
+            int nf=0; float mx=-1e30f,mn=1e30f; for(size_t i=0;i<n;i++){
+                float x=bf16f(v[i]); if(std::isnan(x)){nf++;continue;}
+                if(x>mx)mx=x; if(x<mn)mn=x;} return std::make_tuple(nf,mn,mx);};
+        auto f32fin=[](const float* v, size_t n){
+            int nf=0; float mx=-1e30f,mn=1e30f; for(size_t i=0;i<n;i++){
+                float x=v[i]; if(std::isnan(x)){nf++;continue;}
+                if(x>mx)mx=x; if(x<mn)mn=x;} return std::make_tuple(nf,mn,mx);};
+        auto[nf,mn,mx]=fin(hy3_shared_[1].q_proj.data(), 1<<16);
+        auto[rnf,rmn,rmx]=f32fin(hy3_shared_[1].router.data(), 1<<16);
+        auto[enf,emn,emx]=fin(host_embedding_table_.data(), 4096);
+        fprintf(stderr,"[hy3-verify] L1 q_proj[0:65536]: nan=%d mn=%.4f mx=%.4f | "
+                "L1 router[0:65536]: nan=%d mn=%.4f mx=%.4f | embed row0: nan=%d "
+                "mn=%.4f mx=%.4f\n", nf,mn,mx, rnf,rmn,rmx, enf,emn,emx);
+        std::exit(0);
+    }
+
     /* Auto-discover a <model>.fst.hc sidecar holding only the Hybrid
      * Connection weights (TIDs 23-31).  Lets the 150 GB main .fst stay as-is
      * when HC is added retroactively.  Absence is silent: the engine falls
@@ -1374,7 +1698,8 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     {
         std::string hc_path = fst_path + ".hc";
         struct stat st;
-        if (::stat(hc_path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) {
+        if (config_.arch == ARCH_DS4 &&
+            ::stat(hc_path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) {
             fprintf(stderr, "[npu] Loading HC sidecar: %s (%lld bytes)\n",
                     hc_path.c_str(), (long long)st.st_size);
             load_hc_weights(hc_path);
@@ -1384,11 +1709,13 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     /* Auto-discover a <model>.fst.norm sidecar holding corrected RMSNorm
      * weights + attention sinks (TIDs 1,3,4,14,15,22).  The main .fst baked in
      * ~40x-too-small norms that starve the FFN; this overrides them by TID.
-     * Absence is silent: the engine keeps whatever norms the main .fst had. */
+     * Absence is silent: the engine keeps whatever norms the main .fst had.
+     * HY3 norms are baked correctly in the .fst (no override needed). */
     {
         std::string norm_path = fst_path + ".norm";
         struct stat st;
-        if (::stat(norm_path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) {
+        if (config_.arch == ARCH_DS4 &&
+            ::stat(norm_path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) {
             fprintf(stderr, "[npu] Loading norm sidecar: %s (%lld bytes)\n",
                     norm_path.c_str(), (long long)st.st_size);
             load_norm_override(norm_path);
@@ -1403,9 +1730,13 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
 
     // Preload ALL 43 layers' weights into persistent host_only BOs now.
     // This is ~5.7 GB for the main model; eliminates per-layer BO creation
-    // and sync during inference (the 200s/iteration bottleneck).
+    // and sync during inference (the 200s/iteration bottleneck).  DS4-only:
+    // the HY3 path preloads its GQA BOs in a later phase (load_hy3_shared_weights
+    // populates host vectors first; device BOs come with process_gqa).
+    if (config_.arch == ARCH_DS4) {
     {double tp0=now(); preload_all_layers();
      fprintf(stderr,"[time] preload %.2fs\n", now()-tp0); fflush(stderr);}
+    }
     } /* end !randmat */
 
     {float mx=-1e30f,mn=1e30f; double s=0; for(size_t i=0;i<host_embedding_table_.size();i++){float v=bf16f(host_embedding_table_[i]); if(std::isnan(v)){continue;} if(v>mx)mx=v; if(v<mn)mn=v; s+=(double)v;} fprintf(stderr,"[emb] after preload: %zu elems, mn=%.4f mx=%.4f sum=%.2f [0:4]=",host_embedding_table_.size(),mn,mx,s); for(int i=0;i<4;i++)fprintf(stderr,"%.4f ",bf16f(host_embedding_table_[i])); fprintf(stderr,"\n"); fflush(stderr);}
@@ -1429,10 +1760,22 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // Batched multi-core FFN BO: E_MC=6 slots x 3 (gate|up|down) x proj_elems.
     // 6*3*4096*2048*2 = 288 MB; holds all 6 experts' dequanted weights in the 3x-
     // stride layout the multicore GEMM TAPs read (gate@i*3*N*K, up@+N*K, down@+2*N*K).
-    if (std::getenv("FST_MC_FFN")) {
+    if (config_.arch == ARCH_DS4 && std::getenv("FST_MC_FFN")) {
         constexpr int E_MC = 6;
         const size_t batch_bytes = (size_t)E_MC * 3 * config_.hidden_dim * INTER_DIM * sizeof(bf16_t);
         bo_batch_w_ = xrt::ext::bo(npu_device_, batch_bytes);
+    }
+    // HY3 fused-FFN: same 302 MB bo_batch_w_ (8*3*4096*1536*2 == DS4's
+    // 6*3*4096*2048*2 = 301,989,888 B) holds the 8-expert dequant output in the
+    // expert-major [E,3,N,K] layout the MC kernels read.  Plus an 80 MB
+    // host_only bo_fused_weight_ for the packed MXFP4 input (8*10,027,008 B).
+    if (config_.arch == ARCH_HY3 && hy3_fused_ffn_) {
+        constexpr int E_MC = 8;
+        const size_t batch_bytes = (size_t)E_MC * 3 * config_.hidden_dim * config_.expert_inter_dim * sizeof(bf16_t);
+        bo_batch_w_ = xrt::ext::bo(npu_device_, batch_bytes);   // 302 MB
+        const size_t expert_pk = 3 * (size_t)(config_.expert_inter_dim / 32) * 17 * config_.hidden_dim;
+        bo_fused_weight_ = xrt::bo(npu_device_, (size_t)E_MC * expert_pk,
+                                   xrt::bo::flags::host_only, grp_);   // 80 MB host_only
     }
 
     // 4-set FFN scratch pool for the async expert pipeline.  Each set has its
@@ -1452,7 +1795,9 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     pending_runs_.reserve(64);
 
     // MLA BO-to-BO chain intermediates.  max_seq=128, M_PAD=16 (M=16 std).
-    {
+    // DS4-only: HY3 (GQA) uses expert_gemm_vec + ew_unified, no latent BOs;
+    // its KV cache + GQA BOs are allocated in the process_gqa phase.
+    if (config_.arch == ARCH_DS4) {
         const int S_MAX = config_.max_seq;   // 128
         bo_mla_h_      = xrt::ext::bo(npu_device_, (size_t)16 * config_.hidden_dim * sizeof(bf16_t));
         bo_mla_qc_     = xrt::ext::bo(npu_device_, (size_t)16 * MLA_Q_LORA * sizeof(bf16_t));
@@ -1466,23 +1811,83 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
         bo_rope_lut_   = xrt::ext::bo(npu_device_, (size_t)16 * MLA_ROPE_DIM * sizeof(bf16_t));
     }
 
-    kv_cache_.resize(config_.n_layers);
-    for (auto& kv : kv_cache_) {
-        kv.kv_latent.resize(config_.max_seq * MLA_KV_LORA, 0);
-        kv.k_pe.resize(config_.max_seq * MLA_N_HEADS * config_.rope_dim, 0);
+    // KV cache: DS4 uses the compressed MLA latent (512) + k_pe; HY3's
+    // uncompressed GQA KV (8 heads × 128 × 2) lives in a separate structure
+    // allocated here (one row per cached position, num_kv*head_dim bf16 each).
+    if (config_.arch == ARCH_DS4) {
+        kv_cache_.resize(config_.n_layers);
+        for (auto& kv : kv_cache_) {
+            kv.kv_latent.resize(config_.max_seq * MLA_KV_LORA, 0);
+            kv.k_pe.resize(config_.max_seq * MLA_N_HEADS * config_.rope_dim, 0);
+        }
+        init_kv_cache_bo();
+    } else if (config_.arch == ARCH_HY3) {
+        hy3_kv_cache_.assign(config_.n_layers, Hy3KVCache{});
+        const int kv_row = config_.num_kv_heads * config_.head_dim;  /* 8*128=1024 */
+        for (auto& kv : hy3_kv_cache_) {
+            kv.k.assign((size_t)config_.max_seq * kv_row, f2bf(0.0f));
+            kv.v.assign((size_t)config_.max_seq * kv_row, f2bf(0.0f));
+            kv.n = 0;
+        }
     }
-    init_kv_cache_bo();
+
+    /* FST_HY3_ATTN_PROBE: host-only smoke test of process_gqa on layer 1 with a
+     * synthetic hidden, before the full HY3 generate path is wired (phase 4).
+     * Verifies the GQA math runs end-to-end (rmsnorm → proj GEMM → per-head norm
+     * → YaRN RoPE → KV append → causal softmax → o proj → residual) without
+     * NaN/crash and prints the output range.  Host-first: no NPU calls.  Set
+     * instead of FST_HY3_LOAD_ONLY (the two are mutually exclusive). */
+    if (config_.arch == ARCH_HY3 && std::getenv("FST_HY3_ATTN_PROBE")) {
+        const int hd = config_.hidden_dim;
+        auto synth = [&](bf16_t* h, int off) {
+            for (int d = 0; d < hd; d++) h[d] = f2bf(0.01f * (float)((d + off) % 64) - 0.32f);
+        };
+        /* Case A: M=1 decode-like (single key → softmax identity — exercises
+         * rmsnorm/proj/norm/RoPE/append/o_proj/residual). */
+        {
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> h0(hd);
+            synth(h0.data(), 0);
+            seq_pos_ = 0;
+            double t0 = now();
+            process_gqa(1, h0.data(), 1);
+            float mn = 1e30f, mx = -1e30f; int nf = 0;
+            for (int d = 0; d < hd; d++) { float v = bf16f(h0[d]); if (std::isnan(v)) { nf++; continue; } if (v < mn) mn = v; if (v > mx) mx = v; }
+            fprintf(stderr, "[hy3-attn-probe] L1 M=1: %.3fs nan=%d mn=%.4f mx=%.4f "
+                    "kv.n=%d (exp 1)\n", now()-t0, nf, mn, mx, hy3_kv_cache_[1].n);
+            if (nf) std::exit(1);
+        }
+        /* Case B: M=4 prefill-like — exercises multi-key causal softmax (each
+         * query attends to keys 0..pos).  Fresh cache (reset kv.n). */
+        {
+            const int Mb = 4;
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> hb((size_t)Mb * hd);
+            for (int m = 0; m < Mb; m++) synth(hb.data() + (size_t)m*hd, m*7);
+            hy3_kv_cache_[1].n = 0;          /* reset; rows already zeroed at alloc */
+            seq_pos_ = 0;
+            double t0 = now();
+            process_gqa(1, hb.data(), Mb);
+            int nf = 0; float mn = 1e30f, mx = -1e30f;
+            for (size_t i = 0; i < (size_t)Mb*hd; i++) { float v = bf16f(hb[i]); if (std::isnan(v)) { nf++; continue; } if (v < mn) mn = v; if (v > mx) mx = v; }
+            fprintf(stderr, "[hy3-attn-probe] L1 M=%d: %.3fs nan=%d mn=%.4f mx=%.4f "
+                    "kv.n=%d (exp %d)\n", Mb, now()-t0, nf, mn, mx, hy3_kv_cache_[1].n, Mb);
+            if (nf) std::exit(1);
+        }
+        fflush(stderr);
+        std::exit(0);
+    }
     /* Compressor state: [2*ratio, comp_width] floats for ratio=4 (two-lane),
      * [ratio, comp_width] for ratio=128.  Zeroed; reset_compressor_state() is
-     * called per generation. */
-    cmp_state_.assign(config_.n_layers, CompressorState{});
-    for (int l = 0; l < config_.n_layers; l++) {
-        int ratio = (l < (int)config_.compress_ratios.size()) ? config_.compress_ratios[l] : 0;
-        if (ratio == 0) continue;
-        int cw = (ratio == 4) ? 1024 : 512;
-        int rows = (ratio == 4) ? 2 * ratio : ratio;
-        cmp_state_[l].state_kv.assign((size_t)rows * cw, 0.0f);
-        cmp_state_[l].state_sc.assign((size_t)rows * cw, 0.0f);
+     * called per generation.  DS4-only (V4 KV-compression; HY3 has none). */
+    if (config_.arch == ARCH_DS4) {
+        cmp_state_.assign(config_.n_layers, CompressorState{});
+        for (int l = 0; l < config_.n_layers; l++) {
+            int ratio = (l < (int)config_.compress_ratios.size()) ? config_.compress_ratios[l] : 0;
+            if (ratio == 0) continue;
+            int cw = (ratio == 4) ? 1024 : 512;
+            int rows = (ratio == 4) ? 2 * ratio : ratio;
+            cmp_state_[l].state_kv.assign((size_t)rows * cw, 0.0f);
+            cmp_state_[l].state_sc.assign((size_t)rows * cw, 0.0f);
+        }
     }
 
     pager_ = std::make_unique<ExpertPager>(fst_path, cache_mb * 1024ULL * 1024ULL);
@@ -1491,6 +1896,77 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // bad state when the child process exits without properly releasing
      // hw_contexts and BOs.
     npu_ok = true;
+
+    /* FST_HY3_FFN_PROBE: host-only smoke test of process_ffn_hy3 — L0 (dense
+     * SwiGLU) and L1 (MoE: sigmoid router + 8 routed MXFP4 experts via the
+     * pager + always-on shared expert).  Verifies the FFN math + the expert
+     * bank MXFP4 dequant inverse run without NaN/crash and prints the range.
+     * Host-first: the only SSD I/O is the 8 L1 expert blocks the pager loads
+     * on demand.  Runs after the pager is created (ATTN_PROBE exits earlier;
+     * the two probes don't co-exist). */
+    if (config_.arch == ARCH_HY3 && std::getenv("FST_HY3_FFN_PROBE")) {
+        const int hd = config_.hidden_dim;
+        auto synth = [&](bf16_t* h, int off) {
+            for (int d = 0; d < hd; d++) h[d] = f2bf(0.01f * (float)((d + off) % 64) - 0.32f);
+        };
+        auto range = [&](const bf16_t* h, int n, const char* tag, double dt) -> int {
+            int nf = 0; float mn = 1e30f, mx = -1e30f;
+            for (int i = 0; i < n; i++) { float v = bf16f(h[i]); if (std::isnan(v)) { nf++; continue; } if (v < mn) mn = v; if (v > mx) mx = v; }
+            fprintf(stderr, "[hy3-ffn-probe] %s: %.3fs nan=%d mn=%.4f mx=%.4f\n", tag, dt, nf, mn, mx);
+            return nf;
+        };
+        /* L0 dense: lid=0 < first_k_dense_replace(1) → dense SwiGLU, no router. */
+        {
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> h0(hd);
+            synth(h0.data(), 0);
+            double t0 = now();
+            process_ffn_hy3(0, h0.data(), 1);
+            if (range(h0.data(), hd, "L0 dense M=1", now()-t0)) std::exit(1);
+        }
+        /* L1 MoE: router → 8 routed experts (SSD-loaded by pager) + shared. */
+        {
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> h1(hd);
+            synth(h1.data(), 11);
+            double t0 = now();
+            process_ffn_hy3(1, h1.data(), 1);
+            if (range(h1.data(), hd, "L1 MoE  M=1", now()-t0)) std::exit(1);
+        }
+        fflush(stderr);
+        std::exit(0);
+    }
+
+    /* FST_HY3_NEXTN_PROBE: host-only smoke test of the NextN MTP head (blk.80).
+     * Runs forward_nextn_draft (n_max=3, p_min=0 → all 3) on a synthetic trunk
+     * post-output_norm hidden + a token id, then re-runs step 0 to capture the
+     * post-norm hidden range.  Verifies eh_proj + blk.80 GQA/MoE + shared_head_norm
+     * + shared lm_head run without NaN/crash and produce finite draft tokens. */
+    if (config_.arch == ARCH_HY3 && std::getenv("FST_HY3_NEXTN_PROBE")) {
+        const int hd = config_.hidden_dim;
+        const int V  = config_.vocab_size;
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> h_prev(hd);
+        for (int d = 0; d < hd; d++) h_prev[d] = f2bf(0.01f * (float)(d % 64) - 0.32f);
+        const int last_id = 1;
+        double t0 = now();
+        DraftResult dr = forward_nextn_draft(h_prev.data(), last_id, 3, 0.0f);
+        double dt = now() - t0;
+        /* Re-run step 0 (clean MTP KV) to capture the post-norm hidden range. */
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> hpost(hd);
+        std::vector<float> logits(V);
+        hy3_kv_cache_[config_.n_layers - 1].n = 0;
+        int d0 = forward_nextn_step(last_id, h_prev.data(), 0, hpost.data(), logits.data());
+        int nf = 0; float mn = 1e30f, mx = -1e30f;
+        for (int d = 0; d < hd; d++) { float v = bf16f(hpost[d]); if (std::isnan(v)) { nf++; continue; } if (v < mn) mn = v; if (v > mx) mx = v; }
+        int lf = 0; for (int v = 0; v < V; v++) if (std::isnan(logits[v])) lf++;
+        fprintf(stderr, "[hy3-nextn-probe] draft tokens:");
+        for (int t : dr.tokens) fprintf(stderr, " %d", t);
+        fprintf(stderr, "  conf:");
+        for (float c : dr.confidence) fprintf(stderr, " %.3f", c);
+        fprintf(stderr, "\n[hy3-nextn-probe] step0 draft=%d h_post nan=%d mn=%.4f mx=%.4f "
+                "logits_nan=%d V=%d  %.3fs\n", d0, nf, mn, mx, lf, V, dt);
+        if (nf || lf || dr.tokens.empty()) std::exit(1);
+        fflush(stderr);
+        std::exit(0);
+    }
 }
 
 FSTEngine::~FSTEngine() {
@@ -1510,6 +1986,28 @@ void FSTEngine::load_shared_weights(const std::string& fst_path) {
     config_.top_k = (int)h->tk;
     config_.vocab_size = (int)h->vs;
     config_.expert_block_bytes = (size_t)h->eb;
+
+    /* Arch branch: HY3 (Tencent Hunyuan-3.0, GQA) loads via a TID-based loader
+     * and returns here — the DS4 (MLA) shape-keyed map below does NOT apply
+     * (it collides on HY3's k_proj/v_proj "1024x4096x1" and attn/ffn_norm
+     * "4096x1x1").  The ctor pre-read already set config_.arch; re-derive from
+     * this header so the branch is self-contained, then hand off. */
+    if (h->qh == 64 && h->kh == 8 && h->hd2 == 128) {
+        config_.arch = ARCH_HY3;
+        config_.num_q_heads  = (int)h->qh;        /* 64 */
+        config_.num_kv_heads = (int)h->kh;        /* 8  */
+        config_.head_dim    = (int)h->hd2;        /* 128 */
+        config_.expert_inter_dim = (int)h->id;   /* 1536 */
+        config_.rope_dim    = config_.head_dim;
+        config_.first_k_dense_replace = (int)(h->r1 & 0xFFFFu);
+        config_.expert_gating_func    = (int)((h->r1 >> 16) & 0xFFFFu);
+        config_.rope_scaling_factor   = (float)((h->r2 >> 32) & 0xFFFFFFFFu) / 1000.0f;
+        config_.expert_weights_scale  = (float)(h->r2 & 0xFFFFFFFFu) / 1e6f;
+        config_.yarn_orig_ctx = 262144;
+        ::close(fd);
+        load_hy3_shared_weights(fst_path);
+        return;
+    }
 
     /* DeepSeek-V4 FFN/router params: hardcoded to the HF config.json values
      * (swiglu_limit=10, n_hash_layers=3, scoring_func=sqrtsoftplus) so no
@@ -1799,6 +2297,150 @@ void FSTEngine::load_shared_weights(const std::string& fst_path) {
         auto hbs = pop_tid(31);
         if (hbs.size() >= N_HC * sizeof(float)) { model_.hc_head_base.resize(N_HC); memcpy(model_.hc_head_base.data(), hbs.data(), N_HC * sizeof(float)); }
     }
+    ::close(fd);
+}
+
+/* ── HY3 (Hunyuan-3.0) TID-based shared-bank loader ──────────────────────
+ * The DS4 loader keys tensors by "s0xs1xs2" shape, which collides on HY3
+ * (k_proj & v_proj are both "1024x4096x1"; attn_norm & ffn_norm both
+ * "4096x1x1").  HY3 instead reads each shared-bank tensor by (tid,lid) and
+ * interprets the entry qtype directly.  HY3's shared bank is BF16 (qt=2) +
+ * F32 router/bias (qt=3) — NO Q8_0 — so a raw memcpy suffices (no dequant).
+ * Only the router is transposed [n_experts,hidden]→[hidden,n_experts] to
+ * match router_gemm's [K,N] B layout (the DS4 convention).  Globals (embed/
+ * lm_head/output_norm, lid=0xFFFF) are stored [vocab,hidden]/[hidden] and
+ * copied straight into model_ + host_embedding_table_/host_lm_head_. */
+void FSTEngine::load_hy3_shared_weights(const std::string& fst_path) {
+    /* HY3 shared-bank TIDs (must match scripts/fst_converter.py). */
+    constexpr uint32_t T_EMBED=0, T_OUTPUT_NORM=1, T_LM_HEAD=2,
+        T_INPUT_NORM=3, T_POST_ATTN_NORM=4, T_Q_PROJ=5, T_K_PROJ=6,
+        T_V_PROJ=7, T_O_PROJ=8, T_ROUTER=9, T_ROUTER_BIAS=10,
+        T_SHARED_GATE=11, T_SHARED_UP=12, T_SHARED_DOWN=13,
+        T_HY3_Q_NORM=50, T_HY3_K_NORM=51, T_HY3_DENSE_GATE=52,
+        T_HY3_DENSE_UP=53, T_HY3_DENSE_DOWN=54, T_HY3_NEXTN_EH_PROJ=55,
+        T_HY3_NEXTN_ENORM=56, T_HY3_NEXTN_HNORM=57, T_HY3_NEXTN_SHN=58;
+    constexpr int GLOBAL = 0xFFFF;
+
+    int fd = ::open(fst_path.c_str(), O_RDONLY);
+    if (fd < 0) { ::perror("open fst"); throw std::runtime_error("HY3 open fst"); }
+    auto hb = pread(fd, 128, 0);
+    auto* h = (const FSTH*)hb.data();
+    const size_t ne = (size_t)h->sdc;
+    auto db = pread(fd, ne * 64, (off_t)h->sdo);
+
+    /* Locate one directory entry by (tid,lid); return raw bytes + shape. */
+    struct Ent { std::vector<uint8_t> raw; uint64_t s0=0, s1=0; bool found=false; };
+    auto get = [&](uint32_t tid, int lid) -> Ent {
+        for (size_t i = 0; i < ne; i++) {
+            auto* e = (const FSTE*)(db.data() + i * 64);
+            if (e->tid != tid || (int)e->lid != lid) continue;
+            return { pread(fd, (size_t)e->sz, (off_t)e->off), e->s0, e->s1, true };
+        }
+        return {};
+    };
+    auto to_bf16 = [&](const Ent& en, std::vector<bf16_t, AlignedAllocator<bf16_t>>& v) {
+        if (!en.found) return false;
+        v.resize(en.raw.size() / sizeof(bf16_t));
+        std::memcpy(v.data(), en.raw.data(), en.raw.size());
+        return true;
+    };
+    auto to_f32 = [&](const Ent& en, std::vector<float>& v) {
+        if (!en.found) return false;
+        v.resize(en.raw.size() / sizeof(float));
+        std::memcpy(v.data(), en.raw.data(), en.raw.size());
+        return true;
+    };
+
+    hy3_shared_.assign(config_.n_layers, Hy3LayerWeights{});
+    const int last = config_.n_layers - 1;   /* 80 */
+    for (int l = 0; l < config_.n_layers; l++) {
+        auto& w = hy3_shared_[l];
+        /* every block (0..80): GQA attention + per-head Q/K norm + ffn_norm */
+        to_bf16(get(T_INPUT_NORM,    l), w.attn_norm);   /* [4096] */
+        to_bf16(get(T_Q_PROJ,        l), w.q_proj);      /* [8192,4096] */
+        to_bf16(get(T_K_PROJ,        l), w.k_proj);      /* [1024,4096] */
+        to_bf16(get(T_V_PROJ,        l), w.v_proj);      /* [1024,4096] */
+        to_bf16(get(T_O_PROJ,        l), w.o_proj);      /* [4096,8192] */
+        to_bf16(get(T_HY3_Q_NORM,    l), w.q_norm);      /* [128] */
+        to_bf16(get(T_HY3_K_NORM,    l), w.k_norm);      /* [128] */
+        to_bf16(get(T_POST_ATTN_NORM,l), w.ffn_norm);    /* [4096] */
+
+        if (l < config_.first_k_dense_replace) {
+            /* L0: dense SwiGLU FFN (inter from the stored gate shape). */
+            auto dg = get(T_HY3_DENSE_GATE, l);
+            to_bf16(dg,                       w.dense_gate); /* [13312,4096] */
+            to_bf16(get(T_HY3_DENSE_UP,   l), w.dense_up);
+            to_bf16(get(T_HY3_DENSE_DOWN, l), w.dense_down);/* [4096,13312] */
+            if (dg.found && config_.dense_inter_dim == 0)
+                config_.dense_inter_dim = (int)dg.s0;     /* 13312 */
+        }
+        if (l >= config_.first_k_dense_replace) {
+            /* L1..L80 (incl. the MTP block): sigmoid router + bias + shared.
+             * Router transposed [n_experts,hidden]→[hidden,n_experts] for router_gemm. */
+            auto rr = get(T_ROUTER, l);                 /* F32 [192,4096] */
+            if (to_f32(rr, w.router))
+                transpose_f32(w.router, (int)rr.s0, (int)rr.s1);  /* →[4096,192] */
+            to_f32(get(T_ROUTER_BIAS, l), w.router_bias);         /* F32 [192] */
+            to_bf16(get(T_SHARED_GATE, l), w.shared_gate);        /* [1536,4096] */
+            to_bf16(get(T_SHARED_UP,   l), w.shared_up);
+            to_bf16(get(T_SHARED_DOWN, l), w.shared_down);       /* [4096,1536] */
+        }
+        if (l == last) {
+            /* L80: NextN MTP head tensors (blk.80 also carries the MoE tensors above). */
+            to_bf16(get(T_HY3_NEXTN_EH_PROJ, l), w.nextn_eh_proj);  /* [4096,8192] */
+            to_bf16(get(T_HY3_NEXTN_ENORM,   l), w.nextn_enorm);   /* [4096] */
+            to_bf16(get(T_HY3_NEXTN_HNORM,   l), w.nextn_hnorm);   /* [4096] */
+            to_bf16(get(T_HY3_NEXTN_SHN,     l), w.nextn_shared_head_norm);
+        }
+
+        if ((l + 1) % 10 == 0 || l + 1 == config_.n_layers) {
+            fprintf(stderr, "[hy3-load] L%-3d q=%zu k=%zu v=%zu o=%zu qn=%zu "
+                    "router=%zu rbias=%zu sg=%zu dense_g=%zu eh=%zu\n",
+                    l, w.q_proj.size(), w.k_proj.size(), w.v_proj.size(),
+                    w.o_proj.size(), w.q_norm.size(), w.router.size(),
+                    w.router_bias.size(), w.shared_gate.size(),
+                    w.dense_gate.size(), w.nextn_eh_proj.size());
+            fflush(stderr);
+        }
+    }
+
+    /* globals (lid=0xFFFF): embed [vocab,hidden], lm_head [vocab,hidden],
+     * output_norm [hidden] — all BF16, direct memcpy (engine indexes embed
+     * by tid*hidden and transposes lm_head to padded [hidden,N_PAD] later). */
+    {
+        auto e = get(T_EMBED, GLOBAL);
+        if (e.found) {
+            model_.embedding_bytes = e.raw.size();
+            model_.embedding_table = (bf16_t*)std::malloc(e.raw.size());
+            std::memcpy(model_.embedding_table, e.raw.data(), e.raw.size());
+            host_embedding_table_.resize(e.raw.size() / sizeof(bf16_t));
+            std::memcpy(host_embedding_table_.data(), e.raw.data(), e.raw.size());
+        }
+    }
+    {
+        auto fn = get(T_OUTPUT_NORM, GLOBAL);
+        if (fn.found) {
+            model_.final_norm_bytes = fn.raw.size();
+            model_.final_norm = (bf16_t*)std::malloc(fn.raw.size());
+            std::memcpy(model_.final_norm, fn.raw.data(), fn.raw.size());
+        }
+    }
+    {
+        auto lm = get(T_LM_HEAD, GLOBAL);
+        if (lm.found) {
+            model_.lm_head_bytes = lm.raw.size();
+            model_.lm_head = (bf16_t*)std::malloc(lm.raw.size());
+            std::memcpy(model_.lm_head, lm.raw.data(), lm.raw.size());
+            host_lm_head_.resize(lm.raw.size() / sizeof(bf16_t));
+            std::memcpy(host_lm_head_.data(), lm.raw.data(), lm.raw.size());
+        }
+    }
+    fprintf(stderr, "[hy3-load] done: %d layers, dense_inter_dim=%d, "
+            "embed=%zu lm_head=%zu final_norm=%zu elems\n",
+            config_.n_layers, config_.dense_inter_dim,
+            host_embedding_table_.size(), host_lm_head_.size(),
+            model_.final_norm_bytes / sizeof(bf16_t));
+    fflush(stderr);
     ::close(fd);
 }
 
@@ -2582,6 +3224,16 @@ void FSTEngine::fill_draft_window(int count, const bf16_t* main_x, int base_pos)
  * still operate on a single [M, hd] stream.  Falls back to a plain single-
  * stream add when HC weights are absent (pre-HC .fst). */
 void FSTEngine::process_layer(int lid, bf16_t* h, int M, const int* input_ids) {
+    /* ARCH_HY3: plain-residual GQA block (attention + FFN).  Fully separate
+     * from the DS4 4-stream HC path below — shared_[lid] is empty for HY3, so
+     * branch out before any DS4 state is touched.  FFN (process_ffn_hy3) is a
+     * no-op stub until phase 4; attention is wired + smoke-tested here. */
+    if (config_.arch == ARCH_HY3) {
+        process_gqa(lid, h, M);
+        process_ffn_hy3(lid, h, M);
+        return;
+    }
+
     auto& w = shared_[lid];
     const int hd = config_.hidden_dim, tk = config_.top_k;
     const int hc_stride = N_HC * hd;
@@ -3317,6 +3969,793 @@ void FSTEngine::compress_token(int lid, const bf16_t* hidden_normed, int pos) {
     }
 }
 
+void FSTEngine::process_expert_ffn_hy3(int lid, const bf16_t* h, float* acc, int M,
+                                       const int* eids, const float* wts) {
+    /* Routed-expert FFN.  Default = NPU BO-to-BO chain (mirrors DS4
+     * process_expert_ffn, inter=1536): get_expert_bo (LRU host_only BO) →
+     * hy3_dequant (MXFP4→BF16 B[N,K]) → hy3_gemm/hy3_gemm2 (gate/up) →
+     * silu/mul (ew_unified) → hy3_gemm_down → readback → router-weighted acc.
+     * FST_HY3_HOST_FFN selects the verified host-first path (host dequant + 3
+     * fp32 GEMMs/expert) for A/B correctness comparison.  Expert block =
+     * gate[1536,4096]+up+down[4096,1536] dense MXFP4, 10,027,008 B total. */
+    const int hd = config_.hidden_dim, inter = config_.expert_inter_dim, tk = config_.top_k;
+    const int total = M * tk;
+
+    if (std::getenv("FST_HY3_HOST_FFN")) {
+        const size_t proj_bytes = (size_t)(inter / 32) * 17 * hd;   /* 3,342,336 */
+        const size_t proj_elems = (size_t)inter * hd;
+        const size_t down_elems = (size_t)hd * inter;
+        std::vector<float> hf((size_t)M * hd);
+        for (size_t i = 0; i < (size_t)M * hd; i++) hf[i] = bf16f(h[i]);
+        std::vector<float> gate_f(proj_elems), up_f(proj_elems), down_f(down_elems);
+        std::vector<float> eout((size_t)M * hd, 0.0f);
+        for (int j = 0; j < total; j++) {
+            int e = eids[j]; float w = wts[j]; int m = j / tk;
+            const Expert& exp = pager_->get(lid, e);
+            const uint8_t* pk = exp.packed_weights.data();
+            dequant_mxfp4_dense(gate_f.data(), pk,                inter, hd);
+            dequant_mxfp4_dense(up_f.data(),   pk + proj_bytes,    inter, hd);
+            dequant_mxfp4_dense(down_f.data(), pk + 2 * proj_bytes, hd, inter);
+            swiglu_f32_host(hf.data(), gate_f.data(), up_f.data(), down_f.data(), M, hd, inter, eout.data());
+            for (int d = 0; d < hd; d++) acc[(size_t)m * hd + d] += w * eout[(size_t)m * hd + d];
+        }
+        return;
+    }
+
+    /* FST_HY3_FUSED_FFN (ctor guard): dispatch-collapsed batched path — pack ≤8
+     * experts into one 80 MB BO, ONE dequant + 5 batched MC dispatches (6/layer
+     * vs 48 in the per-op path below).  Guard unset falls through to that path. */
+    if (hy3_fused_ffn_) {
+        process_expert_ffn_hy3_fused(lid, h, acc, M, eids, wts);
+        return;
+    }
+
+    /* ── NPU BO-to-BO routed-expert FFN ── */
+    const int Mx = 16;                       // kernel M-tile (gate/up/down compiled M=16)
+    const int rep = Mx / M;                  // M=1 -> 16, M=16 -> 1
+    const size_t proj_elems = (size_t)hd * inter;
+    const size_t proj_sz    = proj_elems * sizeof(bf16_t);          // 12,582,912 B
+    const size_t full_b     = (size_t)hd * inter * sizeof(bf16_t); // down B [N=hd,K=inter]
+    const size_t in_sz      = (size_t)Mx * hd * sizeof(bf16_t);
+
+    auto& deq_krnl       = kernel_cache_->get("hy3_dequant");
+    auto& gemm_krnl      = kernel_cache_->get("hy3_gemm");       // gate (M=16,K=4096,N=1536)
+    auto& gemm2_krnl     = kernel_cache_->get("hy3_gemm2");      // up   (M=16,K=4096,N=1536)
+    auto& gemm_down_krnl = kernel_cache_->get("hy3_gemm_down"); // down (M=16,K=1536,N=4096)
+
+    if (bo_scratch_in_.size() < in_sz) bo_scratch_in_ = xrt::ext::bo(npu_device_, in_sz);
+    {
+        char* hp = bo_scratch_in_.map<char*>();
+        for (int r = 0; r < rep; r++)
+            std::memcpy(hp + (size_t)r * M * hd * sizeof(bf16_t), h,
+                        (size_t)M * hd * sizeof(bf16_t));
+        int filled = rep * M;
+        if (filled < Mx)
+            std::memset(hp + (size_t)filled * hd * sizeof(bf16_t), 0,
+                        (size_t)(Mx - filled) * hd * sizeof(bf16_t));
+        npu_sync_to(bo_scratch_in_);
+    }
+
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> down_out(Mx * hd);
+
+    /* drain_set: read back set s's down output (after flush) and accumulate the
+     * owner expert's router-weighted contribution into acc. */
+    int drained_count = 0;
+    auto drain_set = [&](int s) {
+        int e = scratch_pool_[s].owner_e;
+        if (e < 0) return;
+        const size_t c_sz = (size_t)Mx * hd * sizeof(bf16_t);
+        npu_sync_from(scratch_pool_[s].bo_down);
+        std::memcpy(down_out.data(), scratch_pool_[s].bo_down.map<char*>(), c_sz);
+        scratch_pool_[s].owner_e = -1;
+
+        /* FST_HY3_FFN_AUDIT: on lid 0 / first drained expert, localize the NPU
+         * divergence vs the host path.  (1) dequant cos: NPU sc.bo_w gate slice
+         * vs host dequant_mxfp4_dense of the same packed expert — isolates the
+         * new 589824-block dequant kernel.  (2) GEMM cos: NPU down_out[0:hd] vs a
+         * host fp32 FFN computed on the NPU-dequanted weights (sc.bo_w) —
+         * isolates the new N=1536 gate/up/down GEMM chain. */
+        if (lid == 1 && drained_count == 0 && std::getenv("FST_HY3_FFN_AUDIT")) {
+            ++drained_count;
+            npu_sync_from(scratch_pool_[s].bo_w);
+            const bf16_t* Wnpu = scratch_pool_[s].bo_w.map<bf16_t*>();
+            const Expert& exp = pager_->get(lid, e);
+            const uint8_t* pk = exp.packed_weights.data();
+            const size_t paud = (size_t)(inter / 32) * 17 * hd;
+            std::vector<float> gate_ref((size_t)inter * hd);
+            dequant_mxfp4_dense(gate_ref.data(), pk, inter, hd);
+            float dmn = 1e30f, dmx = -1e30f, dd = 0; double dot = 0, nn = 0, nr = 0;
+            for (size_t i = 0; i < (size_t)inter * hd; i++) {
+                float a = bf16f(Wnpu[i]), b = gate_ref[i];
+                if (a < dmn) dmn = a; if (a > dmx) dmx = a;
+                float df = std::fabs(a - b); if (df > dd) dd = df;
+                dot += (double)a * b; nn += (double)a * a; nr += (double)b * b;
+            }
+            double dcos = (nn > 0 && nr > 0) ? dot / (std::sqrt(nn) * std::sqrt(nr)) : 0;
+            fprintf(stderr, "[hy3-audit] L0 e=%d DEQUANT gate: npu mn=%.4f mx=%.4f "
+                    "maxdiff=%.4f cos=%.5f |npu|/|ref|=%.5f\n", e, dmn, dmx, dd, dcos,
+                    (nr > 0) ? std::sqrt(nn / nr) : 0); fflush(stderr);
+            const bf16_t* Wg = Wnpu;
+            const bf16_t* Wu = Wnpu + (size_t)inter * hd;
+            const bf16_t* Wd = Wnpu + 2 * (size_t)inter * hd;
+            std::vector<float> act(inter);
+            for (int n = 0; n < inter; n++) {
+                double g = 0, u = 0;
+                for (int k = 0; k < hd; k++) {
+                    g += (double)bf16f(h[k]) * (double)bf16f(Wg[(size_t)n * hd + k]);
+                    u += (double)bf16f(h[k]) * (double)bf16f(Wu[(size_t)n * hd + k]);
+                }
+                float gf = (float)g, uf = (float)u;
+                act[n] = (gf / (1.0f + expf(-gf))) * uf;
+            }
+            float gmn = 1e30f, gmx = -1e30f, gmd = 0; double gdot = 0, gnn = 0, gnr = 0;
+            for (int d = 0; d < hd; d++) {
+                double a = 0;
+                for (int k = 0; k < inter; k++)
+                    a += (double)act[k] * (double)bf16f(Wd[(size_t)d * inter + k]);
+                float ref = (float)a, npu = bf16f(down_out[(size_t)0 * hd + d]);
+                if (npu < gmn) gmn = npu; if (npu > gmx) gmx = npu;
+                float df = std::fabs(npu - ref); if (df > gmd) gmd = df;
+                gdot += (double)npu * ref; gnn += (double)npu * npu; gnr += (double)ref * ref;
+            }
+            double gcos = (gnn > 0 && gnr > 0) ? gdot / (std::sqrt(gnn) * std::sqrt(gnr)) : 0;
+            fprintf(stderr, "[hy3-audit] L0 e=%d GEMM down: npu mn=%.4f mx=%.4f "
+                    "maxdiff=%.4f cos=%.5f |npu|/|ref|=%.5f\n", e, gmn, gmx, gmd, gcos,
+                    (gnr > 0) ? std::sqrt(gnn / gnr) : 0); fflush(stderr);
+        }
+
+        for (int j = 0; j < total; j++) {
+            if (eids[j] != e) continue;
+            int m = j / tk;
+            float w = wts[j];
+            for (int d = 0; d < hd; d++)
+                acc[(size_t)m * hd + d] += bf16f(down_out[(size_t)m * hd + d]) * w;
+        }
+    };
+
+    std::vector<bool> seen(config_.n_experts, false);
+    pool_idx_ = 0;
+    int prev_set = -1;
+
+    for (int i = 0; i < total; i++) {
+        int e = eids[i];
+        if (seen[e]) continue;
+        seen[e] = true;
+
+        const int s = pool_idx_ & 3;
+        ++pool_idx_;
+        ScratchSet& sc = scratch_pool_[s];
+
+        /* NPU MXFP4 dequant → sc.bo_w (BO-to-BO).  get_expert_bo returns a
+         * persistent host_only BO (HIT: no SSD/memcpy; MISS: SSD load + sync,
+         * LRU-bounded by expert_bo_cap_).  hy3_dequant reads exactly 10,027,008 B
+         * (589,824 blocks) and writes 3*proj_elems BF16 = 37.7 MB into sc.bo_w. */
+        xrt::bo& wbo = get_expert_bo(lid, e);
+        npu_sync_to(sc.bo_w);
+        auto drun = deq_krnl(3, 0, 0,
+            static_cast<xrt::bo&>(wbo), static_cast<xrt::bo&>(sc.bo_w),
+            static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_),
+            static_cast<xrt::bo&>(bo_d3_));
+        pending_runs_.push_back(std::move(drun));
+
+        /* Cross-ctx barrier (dequant -> gate): also waits the PREVIOUS expert's
+         * down (async overlap).  Drain prev before reusing its set's BOs. */
+        flush_pending_runs();
+        if (prev_set >= 0) { drain_set(prev_set); prev_set = -1; }
+
+        /* gate + up GEMMs: B read from sc.bo_w sub-buffers (b_col_maj [N,K]). */
+        npu_sync_to(sc.bo_ha);
+        npu_sync_to(sc.bo_hb);
+        {
+            xrt::bo bo_dq_gate(sc.bo_w, proj_sz, 0);
+            auto run = gemm_krnl(3, 0, 0,
+                static_cast<xrt::bo&>(bo_scratch_in_), static_cast<xrt::bo&>(bo_dq_gate),
+                static_cast<xrt::bo&>(sc.bo_ha),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        {
+            xrt::bo bo_dq_up(sc.bo_w, proj_sz, proj_sz);
+            auto run = gemm2_krnl(3, 0, 0,
+                static_cast<xrt::bo&>(bo_scratch_in_), static_cast<xrt::bo&>(bo_dq_up),
+                static_cast<xrt::bo&>(sc.bo_hb),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        flush_pending_runs();
+
+        /* silu(gate) then silu*up (ew_unified, baked N=65536; down reads only
+         * Mx*inter=24576 so the stale tail is ignored — same as DS4). */
+        npu_sync_to(sc.bo_silu);
+        npu_sync_to(sc.bo_mul);
+        npu_ew_async("silu", sc.bo_ha, sc.bo_silu);
+        npu_ew_bin_async("mul", sc.bo_silu, sc.bo_hb, sc.bo_mul);
+        flush_pending_runs();
+
+        /* down GEMM → sc.bo_down.  NO flush/readback yet — overlaps the NEXT
+         * expert's dequant (different hw_context).  owner_e marks a pending drain. */
+        {
+            xrt::bo bo_dq_dn(sc.bo_w, full_b, 2 * proj_sz);
+            xrt::bo bo_c(sc.bo_down, (size_t)Mx * hd * sizeof(bf16_t), 0);
+            auto run = gemm_down_krnl(3, 0, 0,
+                static_cast<xrt::bo&>(sc.bo_mul), static_cast<xrt::bo&>(bo_dq_dn),
+                static_cast<xrt::bo&>(bo_c),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        sc.owner_e = e;
+        prev_set = s;
+    }
+
+    /* Drain the final expert's down. */
+    if (prev_set >= 0) {
+        flush_pending_runs();
+        drain_set(prev_set);
+    }
+}
+
+/* ── ARCH_HY3 routed-expert FFN — dispatch-collapsed (FST_HY3_FUSED_FFN) ────
+ * Replaces the per-op path's 6-dispatches-per-expert loop (48/layer for 8
+ * experts) with a BATCHED multi-core pipeline over all ≤8 unique experts:
+ *   1. host-pack 8 experts' MXFP4 into bo_fused_weight_ (80 MB, ~8 ms)
+ *   2. ONE dequant_8exp dispatch → bo_batch_w_ (302 MB, expert-major [E,3,N,K])
+ *   3. gate MC + up MC (8 cores, 1 expert/core; B sub-buffer @0 / @+proj_sz)
+ *   4. silu_b + mul_b (batched over 8*16*1536 = 196608 elems, reused ew kernels)
+ *   5. down MC (A = silu*up [E*Mx,1536]; B sub @+2*proj_sz) → S.bo_down
+ *   6. host readback + router-weighted accumulate
+ * = 6 dispatches/layer (1 dequant + 2 GEMM + 2 ew + 1 down) vs 48.  Batches
+ * n_unique>8 (prefill M=16 → up to 128 unique) in groups of 8, reusing the BOs.
+ * The dequant output layout (expert-major gate|up|down contiguous) is IDENTICAL
+ * to run_batched_ffn's 3x-stride B layout, so the MC kernels read it via the same
+ * sub-buffer base shifts — verified size-equal: 8*3*4096*1536*2 == 6*3*4096*2048*2. */
+void FSTEngine::process_expert_ffn_hy3_fused(int lid, const bf16_t* h, float* acc, int M,
+                                              const int* eids, const float* wts) {
+    const int hd = config_.hidden_dim, inter = config_.expert_inter_dim, tk = config_.top_k;
+    const int Mx = 16, rep = Mx / M;
+    constexpr int E_MC = 8;
+    const size_t proj_elems = (size_t)hd * inter;            // 6,291,456
+    const size_t proj_sz    = proj_elems * sizeof(bf16_t);   // 12,582,912
+    const size_t slot_sz    = 3 * proj_sz;                   // 37,748,736 (expert slot)
+    const size_t full_b     = (size_t)E_MC * 3 * proj_elems * sizeof(bf16_t); // 301,989,888
+    const size_t expert_pk  = 3 * (size_t)(inter / 32) * 17 * hd;             // 10,027,008
+    const int total = M * tk;
+
+    /* Dedup selected experts (≤ M*tk unique, batched in groups of E_MC=8). */
+    std::vector<int> slot_eids;
+    std::vector<bool> seen(config_.n_experts, false);
+    for (int i = 0; i < total; i++) {
+        int e = eids[i];
+        if (!seen[e]) { seen[e] = true; slot_eids.push_back(e); }
+    }
+    const int n_unique = (int)slot_eids.size();
+    if (n_unique <= 0) return;
+
+    auto& deq_krnl = kernel_cache_->get("hy3_dequant_8exp"); // 8-expert batched dequant
+    auto& gemm_mc  = kernel_cache_->get("hy3_gemm_mc");        // gate/up (a_batched=False)
+    auto& gemm_dn  = kernel_cache_->get("hy3_gemm_down_mc");   // down   (a_batched=True)
+    ScratchSet& S  = scratch_pool_[0];                         // single batch, no ping-pong
+
+    /* Upload activation h replicated to Mx rows (shared read-only A for gate/up). */
+    const size_t in_sz = (size_t)Mx * hd * sizeof(bf16_t);
+    if (bo_scratch_in_.size() < in_sz) bo_scratch_in_ = xrt::ext::bo(npu_device_, in_sz);
+    {
+        char* hp = bo_scratch_in_.map<char*>();
+        for (int r = 0; r < rep; r++)
+            std::memcpy(hp + (size_t)r * M * hd * sizeof(bf16_t), h,
+                        (size_t)M * hd * sizeof(bf16_t));
+        int filled = rep * M;
+        if (filled < Mx)
+            std::memset(hp + (size_t)filled * hd * sizeof(bf16_t), 0,
+                        (size_t)(Mx - filled) * hd * sizeof(bf16_t));
+        npu_sync_to(bo_scratch_in_);
+    }
+
+    bool audited = false;
+    for (int batch_start = 0; batch_start < n_unique; batch_start += E_MC) {
+        const int nbatch = std::min(E_MC, n_unique - batch_start);
+        double ts0 = 0, ts1 = 0, ts2 = 0, ts3 = 0, ts4 = 0, ts5 = 0, ts6 = 0;
+        const bool step_time = (lid == 1 && batch_start == 0 &&
+                                std::getenv("FST_HY3_FUSED_AUDIT"));
+        if (step_time) ts0 = now();
+
+        /* Pack nbatch experts' MXFP4 into bo_fused_weight_ (8×10 MB host→host
+         * memcpy, ~8 ms).  host_only BO is cache-coherent with the NPU on Ryzen
+         * AI, so NO sync(TO_DEVICE) — the dequant DMA reads host memory directly
+         * (same coherence get_expert_bo relies on for per-dispatch reads).  The
+         * prior 80 MB sync measured ~80 ms pure overhead.  Unused slots zeroed
+         * so dequant → 0 → GEMM output exactly 0 (no NaN in the float acc). */
+        {
+            char* wp = bo_fused_weight_.map<char*>();
+            /* Fused path BYPASSES get_expert_bo: pack directly from the pager's
+             * RAM-cached Expert structs.  get_expert_bo's BO cache adds a SERIAL
+             * 10 MB host_only write per BO-cache MISS (~10 ms each = 80 ms/layer)
+             * the fused path doesn't need — dequant_8exp reads this packed BO,
+             * not per-expert BOs.  pager hit_rate=1.0 (RAM), so pager_->get is a
+             * RAM hit (µs).  Fetch the 8 Expert refs serially (get() takes a
+             * mutex), then parallelize the 80 MB write into bo_fused_weight_
+             * (host_only uncacheable; 8 cores aggregate ~33 GB/s vs ~1 GB/s
+             * single-thread).  sync fences the parallel writes for the NPU DMA. */
+            const Expert* exps[E_MC];
+            for (int ls = 0; ls < nbatch; ls++)
+                exps[ls] = &pager_->get(lid, slot_eids[batch_start + ls]);
+            double pm0 = step_time ? now() : 0;
+            #pragma omp parallel for schedule(static)
+            for (int ls = 0; ls < nbatch; ls++)
+                std::memcpy(wp + (size_t)ls * expert_pk,
+                            exps[ls]->packed_weights.data(), expert_pk);
+            double pm1 = step_time ? now() : 0;
+            for (int ls = nbatch; ls < E_MC; ls++)
+                std::memset(wp + (size_t)ls * expert_pk, 0, expert_pk);
+            /* Parallel host writes to uncacheable host_only memory are NOT
+             * ordered w.r.t. the NPU dequant DMA without a sync — a no-sync
+             * parallel pack raced (dequant cos 1.0→0.99995, one stale nibble).
+             * This sync is a coherence fence, NOT the old ~80 ms cost (that was
+             * the BO-cache insert, now bypassed). */
+            bo_fused_weight_.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            if (step_time) {
+                fprintf(stderr, "[hy3-fused-pack] fetch=%.2fms memcpy=%.1fms sync=%.2fms\n",
+                        (pm0 - ts0) * 1e3, (pm1 - pm0) * 1e3, (now() - pm1) * 1e3);
+                fflush(stderr);
+            }
+        }
+        if (step_time) ts1 = now();
+
+        /* (1) dequant all 8 experts → bo_batch_w_ (expert-major [E,3,N,K]). */
+        auto drun = deq_krnl(3, 0, 0,
+            static_cast<xrt::bo&>(bo_fused_weight_), static_cast<xrt::bo&>(bo_batch_w_),
+            static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_),
+            static_cast<xrt::bo&>(bo_d3_));
+        pending_runs_.push_back(std::move(drun));
+        flush_pending_runs();
+        if (step_time) ts2 = now();
+
+        /* (2) gate (B @0) + up (B sub @+proj_sz).  A = bo_scratch_in_ (replicated). */
+        npu_sync_to(S.bo_ha); npu_sync_to(S.bo_hb);
+        {
+            auto run = gemm_mc(3, 0, 0,
+                static_cast<xrt::bo&>(bo_scratch_in_), static_cast<xrt::bo&>(bo_batch_w_),
+                static_cast<xrt::bo&>(S.bo_ha),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        {
+            xrt::bo boBup(bo_batch_w_, full_b - proj_sz, proj_sz);
+            auto run = gemm_mc(3, 0, 0,
+                static_cast<xrt::bo&>(bo_scratch_in_), static_cast<xrt::bo&>(boBup),
+                static_cast<xrt::bo&>(S.bo_hb),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        flush_pending_runs();
+        if (step_time) ts3 = now();
+
+        /* (3) silu(gate)*up on HOST.  The ew_unified silu_b/mul_b kernels are
+         * SINGLE-core (gen_ew_unified.py: one Worker): 196608 elems on one AIE
+         * core = 94 ms (2×47 ms) — the NPU regresses ~100× vs CPU on this 393 KB
+         * elementwise.  Same accepted small-op host deviation as GQA/shared/dense
+         * (NPU regresses small/elementwise work).  2 device→host + 1 host→device
+         * sync of 393 KB ≈ 3-5 ms, CPU silu*up ~0.2 ms.  Float silu is also MORE
+         * accurate than the bf16 ew kernel, so the down-GEMM cos holds/improves.
+         * Removes 2 NPU dispatches/layer (6→4: deq,gate,up,down). */
+        npu_sync_from(S.bo_ha);
+        npu_sync_from(S.bo_hb);
+        {
+            const bf16_t* gate = S.bo_ha.map<bf16_t*>();
+            const bf16_t* up   = S.bo_hb.map<bf16_t*>();
+            bf16_t* mul        = S.bo_mul.map<bf16_t*>();
+            const int nmul = E_MC * Mx * inter;   // 196608
+            #pragma omp parallel for schedule(static)
+            for (int i = 0; i < nmul; i++) {
+                float g = bf16f(gate[i]), u = bf16f(up[i]);
+                mul[i] = f2bf((g / (1.0f + expf(-g))) * u);
+            }
+        }
+        npu_sync_to(S.bo_mul);
+        if (step_time) ts4 = now();
+
+        /* (4) down (A = S.bo_mul [E_MC*Mx,1536]; B sub @+2*proj_sz) → S.bo_down. */
+        npu_sync_to(S.bo_down);
+        {
+            xrt::bo boBdn(bo_batch_w_, full_b - 2 * proj_sz, 2 * proj_sz);
+            auto run = gemm_dn(3, 0, 0,
+                static_cast<xrt::bo&>(S.bo_mul), static_cast<xrt::bo&>(boBdn),
+                static_cast<xrt::bo&>(S.bo_down),
+                static_cast<xrt::bo&>(bo_d1_), static_cast<xrt::bo&>(bo_d2_));
+            pending_runs_.push_back(std::move(run));
+        }
+        flush_pending_runs();
+        if (step_time) ts5 = now();
+
+        /* FST_HY3_FUSED_AUDIT (lid 1, first batch): localize the fused-path NPU
+         * divergence vs host.  (1) dequant cos: bo_batch_w_ slot-0 gate vs host
+         * dequant_mxfp4_dense.  (2) GEMM cos: NPU down[0:hd] vs host fp32 FFN
+         * computed on the NPU-dequanted slot-0 weights. */
+        npu_sync_from(S.bo_down);
+        const bf16_t* down = S.bo_down.map<bf16_t*>();
+        if (step_time) {
+            ts6 = now();
+            fprintf(stderr, "[hy3-fused-step] L1 batch0 M=%d nbatch=%d  pack=%.1f deq=%.1f "
+                    "gateup=%.1f silumul=%.1f down=%.1f readback=%.1f total=%.1fms\n",
+                    M, nbatch, (ts1-ts0)*1e3, (ts2-ts1)*1e3, (ts3-ts2)*1e3, (ts4-ts3)*1e3,
+                    (ts5-ts4)*1e3, (ts6-ts5)*1e3, (ts6-ts0)*1e3); fflush(stderr);
+        }
+        if (lid == 1 && batch_start == 0 && !audited && std::getenv("FST_HY3_FUSED_AUDIT")) {
+            audited = true;
+            int e0 = slot_eids[0];
+            xrt::bo wsub(bo_batch_w_, 3 * proj_sz, 0);   // slot 0 gate|up|down (37.7 MB)
+            npu_sync_from(wsub);
+            const bf16_t* Wnpu = wsub.map<bf16_t*>();
+            const Expert& exp = pager_->get(lid, e0);
+            const uint8_t* pk = exp.packed_weights.data();
+            std::vector<float> gate_ref((size_t)inter * hd);
+            dequant_mxfp4_dense(gate_ref.data(), pk, inter, hd);
+            float dmn=1e30f, dmx=-1e30f, dd=0; double dot=0, nn=0, nr=0;
+            for (size_t i = 0; i < (size_t)inter * hd; i++) {
+                float a = bf16f(Wnpu[i]), b = gate_ref[i];
+                if (a < dmn) dmn = a; if (a > dmx) dmx = a;
+                float df = std::fabs(a - b); if (df > dd) dd = df;
+                dot += (double)a * b; nn += (double)a * a; nr += (double)b * b;
+            }
+            double dcos = (nn > 0 && nr > 0) ? dot / (std::sqrt(nn) * std::sqrt(nr)) : 0;
+            fprintf(stderr, "[hy3-fused-audit] L1 e=%d DEQUANT gate: npu mn=%.4f mx=%.4f "
+                    "maxdiff=%.4f cos=%.5f |npu|/|ref|=%.5f\n", e0, dmn, dmx, dd, dcos,
+                    (nr > 0) ? std::sqrt(nn / nr) : 0); fflush(stderr);
+            const bf16_t* Wg = Wnpu;
+            const bf16_t* Wu = Wnpu + (size_t)inter * hd;
+            const bf16_t* Wd = Wnpu + 2 * (size_t)inter * hd;
+            std::vector<float> act(inter);
+            for (int n = 0; n < inter; n++) {
+                double g = 0, u = 0;
+                for (int k = 0; k < hd; k++) {
+                    g += (double)bf16f(h[k]) * (double)bf16f(Wg[(size_t)n * hd + k]);
+                    u += (double)bf16f(h[k]) * (double)bf16f(Wu[(size_t)n * hd + k]);
+                }
+                float gf = (float)g, uf = (float)u;
+                act[n] = (gf / (1.0f + expf(-gf))) * uf;
+            }
+            float gmn=1e30f, gmx=-1e30f, gmd=0; double gdot=0, gnn=0, gnr=0;
+            for (int d = 0; d < hd; d++) {
+                double a = 0;
+                for (int k = 0; k < inter; k++)
+                    a += (double)act[k] * (double)bf16f(Wd[(size_t)d * inter + k]);
+                float ref = (float)a, npu = bf16f(down[(size_t)0 * hd + d]);
+                if (npu < gmn) gmn = npu; if (npu > gmx) gmx = npu;
+                float df = std::fabs(npu - ref); if (df > gmd) gmd = df;
+                gdot += (double)npu * ref; gnn += (double)npu * npu; gnr += (double)ref * ref;
+            }
+            double gcos = (gnn > 0 && gnr > 0) ? gdot / (std::sqrt(gnn) * std::sqrt(gnr)) : 0;
+            fprintf(stderr, "[hy3-fused-audit] L1 e=%d GEMM down: npu mn=%.4f mx=%.4f "
+                    "maxdiff=%.4f cos=%.5f |npu|/|ref|=%.5f\n", e0, gmn, gmx, gmd, gcos,
+                    (gnr > 0) ? std::sqrt(gnn / gnr) : 0); fflush(stderr);
+        }
+
+        /* (5) host readback + router-weighted accumulate.  Expert slot ls (eid e)
+         * contributed down[ls*Mx + m, :]; weight w = wts[m*tk + j] where eids==e. */
+        for (int ls = 0; ls < nbatch; ls++) {
+            int e = slot_eids[batch_start + ls];
+            for (int m = 0; m < M; m++) {
+                float w = 0.0f; bool found = false;
+                for (int j = 0; j < tk; j++) {
+                    if (eids[m * tk + j] == e) { w = wts[m * tk + j]; found = true; break; }
+                }
+                if (!found || w == 0.0f) continue;
+                const bf16_t* row = down + (size_t)(ls * Mx + m) * hd;
+                for (int d = 0; d < hd; d++)
+                    acc[(size_t)m * hd + d] += bf16f(row[d]) * w;
+            }
+        }
+    }
+}
+
+/* ── Hunyuan-3.0 FFN (ARCH_HY3) ───────────────────────────────────────────
+ * Host-first correctness implementation (phase 3).  ffn_norm RMSNorm, then:
+ *   L0 (lid < first_k_dense_replace): dense SwiGLU on dense_gate/up/down (BF16).
+ *   L1..L79: sigmoid router → top-8 routed experts (MXFP4, host dequant + GEMM)
+ *            + 1 always-on shared expert (BF16).  ffn_out added to h (residual).
+ * The NPU expert path (new 1536-inter kernels) is deferred; the dense + shared
+ * BF16 paths move to NPU expert_gemm_vec in a later sub-phase. */
+void FSTEngine::process_ffn_hy3(int lid, bf16_t* h, int M) {
+    auto& w = hy3_shared_[lid];
+    const int hd = config_.hidden_dim;
+    const float eps = 1e-5f;
+
+    /* 1. FFN input RMSNorm → hn [M, hd]. */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> hn((size_t)M * hd);
+    rms_cpu(hn.data(), h, w.ffn_norm.data(), hd, M, eps);
+
+    std::vector<float> ffn((size_t)M * hd, 0.0f);
+
+    if (lid < config_.first_k_dense_replace) {
+        /* Dense L0 SwiGLU (inter 13312) — no router, no shared expert. */
+        swiglu_bf16_host(hn.data(), w.dense_gate.data(), w.dense_up.data(),
+                         w.dense_down.data(), M, hd, config_.dense_inter_dim, ffn.data());
+    } else {
+        /* MoE: router → top-8 routed experts + always-on shared. */
+        std::vector<int> eids((size_t)M * config_.top_k);
+        std::vector<float> wts((size_t)M * config_.top_k);
+        hy3_router_host(eids.data(), wts.data(), hn.data(), w.router.data(),
+                        w.router_bias.data(), M, config_.n_experts, config_.top_k,
+                        hd, config_.expert_weights_scale);
+        /* Predictive prefetch (lever 1): queue this layer's experts + the next
+         * `prefetch_ahead_` layers' (Markov: same expert ids) so the SSD worker
+         * reads them while this layer's FFN runs on the NPU.  Without this,
+         * every get() is a reactive miss that blocks ~83 ms on SSD.  Unique the
+         * eids (M*top_k with dups across tokens) so the dedup scan stays small.
+         * Gated on prefetch_ahead_>=1 so FST_PREFETCH_AHEAD=0 = old baseline. */
+        if (pager_ && pager_->prefetch_ahead() >= 1) {
+            std::vector<int> ueids(eids.begin(), eids.end());
+            std::sort(ueids.begin(), ueids.end());
+            ueids.erase(std::unique(ueids.begin(), ueids.end()), ueids.end());
+            pager_->predict_and_prefetch(lid, ueids.data(), (int)ueids.size());
+        }
+        process_expert_ffn_hy3(lid, hn.data(), ffn.data(), M, eids.data(), wts.data());
+
+        /* Always-on shared expert (BF16, inter 1536) — ungated, full strength. */
+        std::vector<float> shared_out((size_t)M * hd, 0.0f);
+        swiglu_bf16_host(hn.data(), w.shared_gate.data(), w.shared_up.data(),
+                         w.shared_down.data(), M, hd, config_.expert_inter_dim, shared_out.data());
+        for (size_t i = 0; i < (size_t)M * hd; i++) ffn[i] += shared_out[i];
+    }
+
+    /* 2. residual add (h += ffn). */
+    for (size_t i = 0; i < (size_t)M * hd; i++)
+        h[i] = f2bf(bf16f(h[i]) + ffn[i]);
+
+    if (std::getenv("FST_HY3_LAYER_TIME")) {
+        static double prev = now(), t0 = now();
+        double t = now();
+        fprintf(stderr, "[hy3-layer] L%d dt=%.1fms cum=%.0fms M=%d\n", lid,
+                (t - prev) * 1000.0, (t - t0) * 1000.0, M); fflush(stderr);
+        prev = t;
+    }
+}
+
+/* ── Hunyuan-3.0 GQA attention (ARCH_HY3) ──────────────────────────────────
+ * Host-first correctness implementation.  The heavy q/k/v/o proj GEMMs move
+ * to NPU (qck for k/v, ob for q/o) in a later speed sub-phase; everything here
+ * is fp32-accumulated host math so the YaRN RoPE / per-head norm / GQA / causal
+ * softmax are verifiable against HF hy_v3 before going near the device.
+ *
+ *   h [M, hd] in/out (attention output ADDED — residual).
+ *   seq_pos_ .. seq_pos_+M-1 are the M query positions; cache grows to S=seq_pos_+M.
+ *
+ * Math (HF hy_v3): RMSNorm(attn_norm) → q/k/v proj → per-head Q/K RMSNorm(d=128)
+ * → YaRN RoPE (NeoX rotate-half, base 11158840, factor 4.0, orig 262144; mscale
+ * folded into cos/sin) → append uncompressed 8×128 KV → QK·(1/√128) causal →
+ * softmax → V → o proj → +residual.  eps=1e-5 (h->re). */
+void FSTEngine::process_gqa(int lid, bf16_t* h, int M) {
+    assert(seq_pos_ + M <= config_.max_seq);
+    auto& w = hy3_shared_[lid];
+    const int hd    = config_.hidden_dim;       /* 4096 */
+    const int nq    = config_.num_q_heads;      /* 64   */
+    const int nkv   = config_.num_kv_heads;     /* 8    */
+    const int dh    = config_.head_dim;         /* 128  */
+    const int half  = dh / 2;                    /* 64   */
+    const int qrow  = nq * dh;                   /* 8192 */
+    const int kvrow = nkv * dh;                  /* 1024 */
+    const int S     = seq_pos_ + M;              /* cache rows after append */
+    const float scale = 1.0f / std::sqrt((float)dh);   /* 1/√128 */
+    const float eps = 1e-5f;                            /* HY3 rms_norm_eps (h->re) */
+    const float base = rope_freq_base_;                 /* 11158840 */
+    const float yarn_factor = config_.rope_scaling_factor; /* 4.0 */
+    const int   yarn_orig    = config_.yarn_orig_ctx;       /* 262144 */
+
+    /* YaRN inv_freq[64] — computed once per call (64 pow vs the proj GEMMs).
+     * find_correction_dim(num_rot) = dh·ln(orig/(num_rot·2π)) / (2·ln(base)),
+     * low=floor(corr(βfast=32)), high=ceil(corr(βslow=1)); ramp blends
+     * extrapolation (low dim, no scaling) ↔ interpolation (high dim, ÷factor).
+     * Matches HF hy_v3 YaRN (βfast/βslow default 32/1). */
+    float inv_freq[64];
+    {
+        const float lcl = (dh * std::log((float)yarn_orig / (32.0f * 2.0f * (float)M_PI))) / (2.0f * std::log(base));
+        const float hcl = (dh * std::log((float)yarn_orig / (1.0f  * 2.0f * (float)M_PI))) / (2.0f * std::log(base));
+        int low  = (int)std::floor(lcl); if (low < 0) low = 0;
+        int high = (int)std::ceil(hcl);  if (high > dh - 1) high = dh - 1;
+        if (high <= low) high = low + 1;   /* linear_ramp min==max guard */
+        for (int i = 0; i < half; i++) {
+            float pos_freq = std::pow(base, (2.0f * (float)i) / (float)dh);
+            float extrap = 1.0f / pos_freq;                 /* inv_freq_extrapolation */
+            float interp = extrap / yarn_factor;            /* inv_freq_interpolation */
+            float ramp = (float)(i - low) / (float)(high - low);
+            if (ramp < 0.0f) ramp = 0.0f;
+            if (ramp > 1.0f) ramp = 1.0f;
+            float extrap_factor = 1.0f - ramp;               /* 1@low dim, 0@high dim */
+            inv_freq[i] = interp * (1.0f - extrap_factor) + extrap * extrap_factor;
+        }
+    }
+    /* mscale folded into cos/sin (HF hy_v3: cos*=mscale, sin*=mscale). */
+    const float mscale = (yarn_factor <= 1.0f) ? 1.0f
+                        : 0.1f * std::log(yarn_factor) + 1.0f;   /* 1.1386 */
+
+    /* 1. input RMSNorm → an [M, hd] bf16. */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> an((size_t)M * hd);
+    rms_cpu(an.data(), h, w.attn_norm.data(), hd, M, eps);
+
+    /* 2. q/k/v projections (host fp32 GEMM; B native [N,K]=[out,in]). */
+    std::vector<float> q((size_t)M * qrow), k((size_t)M * kvrow), v((size_t)M * kvrow);
+    host_gemm_bnk_f32(q.data(), an.data(), w.q_proj.data(), M, nq * dh,  hd);
+    host_gemm_bnk_f32(k.data(), an.data(), w.k_proj.data(), M, nkv * dh, hd);
+    host_gemm_bnk_f32(v.data(), an.data(), w.v_proj.data(), M, nkv * dh, hd);
+
+    /* 3. per-head Q/K RMSNorm (d=dh, over each head's 128 dims) in fp32.  q is
+     * [M, nq, dh], k is [M, nkv, dh], row-major. */
+    auto rmsnorm_rows = [&](float* x, const bf16_t* wg, int nrows) {
+        for (int r = 0; r < nrows; r++) {
+            float* xr = x + (size_t)r * dh;
+            float ss = 0.0f;
+            for (int d = 0; d < dh; d++) ss += xr[d] * xr[d];
+            float rcp = 1.0f / std::sqrt(ss / (float)dh + eps);
+            for (int d = 0; d < dh; d++) xr[d] = xr[d] * rcp * bf16f(wg[d]);
+        }
+    };
+    rmsnorm_rows(q.data(), w.q_norm.data(), M * nq);
+    rmsnorm_rows(k.data(), w.k_norm.data(), M * nkv);
+
+    /* 4. YaRN RoPE (NeoX rotate-half) per head, per position (abs pos = seq_pos_+m). */
+    auto rope_head = [&](float* x, int pos) {
+        for (int j = 0; j < half; j++) {
+            float ang = (float)pos * inv_freq[j];
+            float cf = std::cos(ang) * mscale;
+            float sf = std::sin(ang) * mscale;
+            float a = x[j], b = x[j + half];
+            x[j]        = a * cf - b * sf;     /* rotate_half = cat(-x2, x1) */
+            x[j + half] = b * cf + a * sf;
+        }
+    };
+    for (int m = 0; m < M; m++) {
+        int pos = seq_pos_ + m;
+        for (int hh = 0; hh < nq; hh++)  rope_head(q.data() + ((size_t)m * nq  + hh) * dh, pos);
+        for (int hh = 0; hh < nkv; hh++) rope_head(k.data() + ((size_t)m * nkv + hh) * dh, pos);
+    }
+
+    /* 5. append the M new K/V rows to the uncompressed cache (v is NOT
+     * normed/roped — only q and k are). */
+    auto& kv = hy3_kv_cache_[lid];
+    for (int m = 0; m < M; m++) {
+        bf16_t* krow = kv.k.data() + (size_t)(seq_pos_ + m) * kvrow;
+        bf16_t* vrow = kv.v.data() + (size_t)(seq_pos_ + m) * kvrow;
+        const float* km = k.data() + (size_t)m * kvrow;
+        const float* vm = v.data() + (size_t)m * kvrow;
+        for (int i = 0; i < kvrow; i++) { krow[i] = f2bf(km[i]); vrow[i] = f2bf(vm[i]); }
+    }
+    kv.n = S;
+
+    /* 6. GQA attention.  Each query head hq uses KV head hq/(nq/nkv).  Query at
+     * abs pos qpos attends to keys 0..qpos (causal — just cap nkeys, no -inf
+     * mask).  fp32 throughout; V read from the bf16 cache. */
+    std::vector<float> out((size_t)M * qrow, 0.0f);
+    std::vector<float> scores((size_t)S), prob((size_t)S);
+    const int group = nq / nkv;   /* 8 Q heads share one KV head */
+    for (int m = 0; m < M; m++) {
+        const int qpos  = seq_pos_ + m;
+        const int nkeys = qpos + 1;            /* causal */
+        for (int hq = 0; hq < nq; hq++) {
+            const int kvh = hq / group;
+            const float* qh = q.data() + ((size_t)m * nq + hq) * dh;
+            const bf16_t* kbase = kv.k.data() + (size_t)kvh * dh;   /* stride kvrow */
+            float mx = -1e30f;
+            for (int kk = 0; kk < nkeys; kk++) {
+                const bf16_t* krow = kbase + (size_t)kk * kvrow;
+                float s = 0.0f;
+                for (int d = 0; d < dh; d++) s += qh[d] * bf16f(krow[d]);
+                s *= scale;
+                scores[kk] = s;
+                if (s > mx) mx = s;
+            }
+            float sum = 0.0f;
+            for (int kk = 0; kk < nkeys; kk++) { float p = std::exp(scores[kk] - mx); prob[kk] = p; sum += p; }
+            float inv = 1.0f / (sum + 1e-20f);
+            float* outh = out.data() + ((size_t)m * nq + hq) * dh;
+            const bf16_t* vbase = kv.v.data() + (size_t)kvh * dh;   /* stride kvrow */
+            for (int kk = 0; kk < nkeys; kk++) {
+                float pv = prob[kk] * inv;
+                const bf16_t* vrow = vbase + (size_t)kk * kvrow;
+                for (int d = 0; d < dh; d++) outh[d] += pv * bf16f(vrow[d]);
+            }
+        }
+    }
+
+    /* 7. output projection (host fp32 GEMM; o_proj [hd, nq*dh]=[out=4096, in=8192]). */
+    std::vector<float> o((size_t)M * hd, 0.0f);
+    host_gemm_xnk_f32(o.data(), out.data(), w.o_proj.data(), M, hd, qrow);
+
+    /* 8. residual add (h += o). */
+    for (int m = 0; m < M; m++)
+        for (int d = 0; d < hd; d++) {
+            size_t idx = (size_t)m * hd + d;
+            h[idx] = f2bf(bf16f(h[idx]) + o[idx]);
+        }
+}
+
+/* ── Hunyuan-3.0 NextN MTP head (ARCH_HY3, blk.80) ──────────────────────────
+ * Replaces the DSpark draft path.  Host-first correctness: the MTP block is a
+ * full GQA+MoE decoder (hy3_shared_[n_layers-1] has attn/ffn/router/shared +
+ * the 4 nextn_* tensors), so it reuses process_gqa/process_ffn_hy3 on lid 80.
+ * The MTP keeps its OWN KV (hy3_kv_cache_[80]); seq_pos_ is driven per step so
+ * RoPE position, KV append offset and causal length all track the MTP step.
+ * KV seeding (trunk-KV copy) + global-vs-local position semantics are deferred
+ * to the fork-validation step — this first cut is a self-contained predictor. */
+int FSTEngine::forward_nextn_step(int last_token_id, const bf16_t* h_prev, int step,
+                                   bf16_t* h_post, float* logits) {
+    const int hd = config_.hidden_dim;
+    const int V  = config_.vocab_size;
+    const int mtp_lid = config_.n_layers - 1;          /* blk.80 */
+    auto& w = hy3_shared_[mtp_lid];
+    const float eps = 1e-5f;
+
+    /* 1. e = embed(last_token_id); e_norm = rms(enorm, e); h_norm = rms(hnorm, h_prev). */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> e(hd), e_norm(hd), h_norm(hd);
+    std::memcpy(e.data(), host_embedding_table_.data() + (size_t)last_token_id * hd,
+                (size_t)hd * sizeof(bf16_t));
+    rms_cpu(e_norm.data(), e.data(),  w.nextn_enorm.data(), hd, 1, eps);
+    rms_cpu(h_norm.data(), h_prev,    w.nextn_hnorm.data(), hd, 1, eps);
+
+    /* 2. concat [e_norm; h_norm] [2*hd] → eh_proj [hd, 2*hd] → h_mtp [hd] (fp32→bf16). */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> concat((size_t)2 * hd);
+    std::memcpy(concat.data(),       e_norm.data(), (size_t)hd * sizeof(bf16_t));
+    std::memcpy(concat.data() + hd,  h_norm.data(), (size_t)hd * sizeof(bf16_t));
+    std::vector<float> hmtp(hd);
+    host_gemm_bnk_f32(hmtp.data(), concat.data(), w.nextn_eh_proj.data(), 1, hd, 2 * hd);
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> h_mtp(hd);
+    for (int d = 0; d < hd; d++) h_mtp[d] = f2bf(hmtp[d]);
+
+    /* 3. blk.80 forward (own KV; seq_pos_=step): GQA + MoE FFN. */
+    seq_pos_ = step;
+    process_gqa(mtp_lid, h_mtp.data(), 1);
+    process_ffn_hy3(mtp_lid, h_mtp.data(), 1);
+
+    /* 4. h_post = rms(shared_head_norm, h_mtp) — next step's h_prev (post-norm
+     *    chaining, HY3 gotcha #6: chaining raw residuals gives wrong drafts). */
+    rms_cpu(h_post, h_mtp.data(), w.nextn_shared_head_norm.data(), hd, 1, eps);
+
+    /* 5. logits = lm_head @ h_post (host [V,hd] row-major); argmax → draft token. */
+    int amx = 0; float mx = -1e30f;
+    for (int v = 0; v < V; v++) {
+        const bf16_t* row = host_lm_head_.data() + (size_t)v * hd;
+        float l = 0.0f;
+        for (int d = 0; d < hd; d++) l += bf16f(row[d]) * bf16f(h_post[d]);
+        logits[v] = l;
+        if (l > mx) { mx = l; amx = v; }
+    }
+    return amx;
+}
+
+/* Iterative NextN drafting up to n_max steps with a p_min confidence cutoff.
+ * Chains h_post → h_prev across steps (post-norm).  Returns the draft tokens +
+ * greedy-probability confidences.  The MTP KV is reset per draft session. */
+FSTEngine::DraftResult FSTEngine::forward_nextn_draft(const bf16_t* h_prev, int last_token_id,
+                                                     int n_max, float p_min) {
+    const int hd = config_.hidden_dim;
+    const int V  = config_.vocab_size;
+    DraftResult res;
+    res.tokens.reserve(n_max);
+    res.confidence.reserve(n_max);
+
+    /* MTP own KV starts fresh for this draft session (separate from trunk KV). */
+    hy3_kv_cache_[config_.n_layers - 1].n = 0;
+
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> h_cur(hd), h_post(hd);
+    std::memcpy(h_cur.data(), h_prev, (size_t)hd * sizeof(bf16_t));
+    std::vector<float> logits(V);
+    int last_id = last_token_id;
+
+    for (int k = 0; k < n_max; k++) {
+        int draft = forward_nextn_step(last_id, h_cur.data(), k, h_post.data(), logits.data());
+        /* confidence = softmax(logits)[draft] (greedy probability). */
+        float mx = logits[0];
+        for (int v = 1; v < V; v++) if (logits[v] > mx) mx = logits[v];
+        double sum = 0.0;
+        for (int v = 0; v < V; v++) sum += std::exp((double)(logits[v] - mx));
+        float conf = (float)(std::exp((double)(logits[draft] - mx)) / sum);
+        if (k > 0 && conf < p_min) break;          /* p_min cutoff (exact rule is fork-specific) */
+        res.tokens.push_back(draft);
+        res.confidence.push_back(conf);
+        std::memcpy(h_cur.data(), h_post.data(), (size_t)hd * sizeof(bf16_t));  /* chain */
+        last_id = draft;
+    }
+    return res;
+}
+
 void FSTEngine::process_mla(int lid, bf16_t* h, int M) {
     /* DeepSeek V4 Flash latent MLA — FULLY vectorized NPU GEMM path
      * (canonical kernels.mm + zero, 100% aie::mmul, ZERO scalar, ZERO CPU
@@ -3903,8 +5342,8 @@ xrt::bo& FSTEngine::get_expert_bo(int lid, int e) {
      * touches the pager), then copy its packed weights once into a new BO. */
     const Expert& exp = pager_->get(lid, e);
     const size_t bytes = exp.packed_weights.size();
-    /* Evict LRU until there's room for `bytes` under EXPERT_BO_CAP. */
-    while (expert_bo_bytes_ + bytes > EXPERT_BO_CAP && !expert_bo_lru_.empty()) {
+    /* Evict LRU until there's room for `bytes` under expert_bo_cap_. */
+    while (expert_bo_bytes_ + bytes > expert_bo_cap_ && !expert_bo_lru_.empty()) {
         CacheKey old = expert_bo_lru_.back();
         expert_bo_lru_.pop_back();
         auto oit = expert_bo_cache_.find(old);
@@ -6200,8 +7639,117 @@ void FSTEngine::generate_dspark(const std::vector<int>& token_ids, int mt,
     }
 }
 
+/* ── Hunyuan-3.0 greedy autoregressive generation (ARCH_HY3, --no-sd) ───────
+ * Host-first E2E: prefill the prompt through the trunk (blk.0..n_layers-2 —
+ * the MTP block blk.80 is NOT a trunk layer) → output_norm (model_.final_norm)
+ * → shared lm_head (host_lm_head_) → greedy argmax; decode one token/step the
+ * same way.  Reuses process_gqa/process_ffn_hy3 (via process_layer's HY3 branch)
+ * on a plain [M,hd] hidden (no HC streams).  seq_pos_ tracks absolute position:
+ * prefill fills 0..M-1 per layer (layer-major, full causal); decode continues at
+ * M, M+1, …  No draft/MTP (MTP drafting + SD acceptance are a later phase).
+ * Greedy (temperature/top_p ignored for argmax). */
+void FSTEngine::generate_hy3(const std::vector<int>& token_ids, int mt, float /*temperature*/,
+                             float /*top_p*/, void(*cb)(int,const char*,void*), void* u) {
+    const int N    = mt > 0 ? mt : 3;
+    const int hd   = config_.hidden_dim;
+    const int V    = config_.vocab_size;
+    const int ndec = config_.n_layers - 1;           /* trunk = blk.0..ndec-1 (excludes MTP) */
+    const int CHUNK = 16;
+    const float eps = 1e-5f;
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto t1 = t0;
+    try {
+        /* 1. prefill: embed prompt → [M, hd] plain, run trunk blk.0..ndec-1.
+         *    Layer-major: each layer sees all M positions with full causal
+         *    (kv[l] accumulates rows 0..M-1; seq_pos_ reset per layer). */
+        int M = (int)token_ids.size();
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> hidden = forward_embeddings(token_ids);
+        is_prefill_ = true;
+        for (int l = 0; l < ndec; l++) {
+            seq_pos_ = 0;
+            for (int off = 0; off < M; ) {
+                int m = std::min(CHUNK, M - off);
+                process_layer(l, hidden.data() + (size_t)off * hd, m, token_ids.data() + off);
+                seq_pos_ += m;
+                off += m;
+            }
+        }
+        seq_pos_ = M;                                /* next decode token is at position M */
+
+        /* output_norm + shared lm_head → greedy argmax (host matvec). */
+        auto argmax_head = [&](const bf16_t* h, float* logits) -> int {
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> hn(hd);
+            rms_cpu(hn.data(), h, model_.final_norm, hd, 1, eps);
+            int amx = 0; float mx = -1e30f;
+            for (int v = 0; v < V; v++) {
+                const bf16_t* row = host_lm_head_.data() + (size_t)v * hd;
+                float s = 0.0f;
+                for (int d = 0; d < hd; d++) s += bf16f(row[d]) * bf16f(hn[d]);
+                logits[v] = s;
+                if (s > mx) { mx = s; amx = v; }
+            }
+            return amx;
+        };
+        std::vector<float> logits(V);
+        int tid = argmax_head(hidden.data() + (size_t)(M - 1) * hd, logits.data());
+        fprintf(stderr, "[hy3-gen] prefill-last=%d (M=%d)\n", tid, M); fflush(stderr);
+        if (cb) cb(tid, "", u);
+
+        t1 = std::chrono::steady_clock::now();
+        double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        int tokens_generated = 1;
+
+        /* 2. decode loop: embed prev token → [1,hd] → trunk → output_norm+lm_head → argmax. */
+        for (int tok = 1; tok < N; tok++) {
+            std::vector<bf16_t, AlignedAllocator<bf16_t>> dec(hd, f2bf(0.0f));
+            if (tid >= 0 && tid < V)
+                std::memcpy(dec.data(), host_embedding_table_.data() + (size_t)tid * hd,
+                            (size_t)hd * sizeof(bf16_t));
+            for (int l = 0; l < ndec; l++)
+                process_layer(l, dec.data(), 1, &tid);
+            tid = argmax_head(dec.data(), logits.data());
+            fprintf(stderr, "[hy3-gen] decode=%d (pos=%d)\n", tid, seq_pos_); fflush(stderr);
+            if (cb) cb(tid, "", u);
+            tokens_generated++;
+            seq_pos_ += 1;
+            if (seq_pos_ >= config_.max_seq - 1) break;   /* HY3 eos handling deferred */
+        }
+
+        auto t2 = std::chrono::steady_clock::now();
+        double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        double tps = (tokens_generated > 1) ? (double)(tokens_generated - 1) / (decode_ms / 1000.0) : 0.0;
+
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "\n  HY3 Prefill: %.1f ms (%d prompt tokens, %d trunk layers)\n",
+                prefill_ms, M, ndec);
+        fprintf(stderr, "  HY3 Decode Tokens/sec: %.2f\n", tps);
+        fprintf(stderr, "  Peak RAM (RSS): %.1f GB\n", (double)ru.ru_maxrss / 1048576.0);
+        if (pager_)
+            fprintf(stderr, "  Expert Pager: gets=%ld hits=%ld misses=%ld hit_rate=%.3f "
+                    "wait=%ldms/%ld (max=%ldus) prefetched=%ld cache=%zuMB\n",
+                    pager_->gets(), pager_->hits(), pager_->misses(), pager_->hit_rate(),
+                    pager_->wait_us()/1000, pager_->wait_count(), pager_->max_wait_us(),
+                    pager_->prefetched(), pager_->cache_size() >> 20);
+        auto cs = kernel_cache_->stats();
+        fprintf(stderr, "  NPU Contexts: creates=%d evictions=%d hits=%d active=%zu\n",
+                cs.creates, cs.evictions, cs.hits, kernel_cache_->active_contexts());
+
+    } catch (const xrt::run::aie_error& e) {
+        fprintf(stderr, "\n[FATAL] XRT/AIE error: %s\n", e.what()); std::exit(1);
+    } catch (const xrt::run::command_error& e) {
+        fprintf(stderr, "\n[FATAL] XRT command error: %s\n", e.what()); std::exit(1);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "\n[FATAL] %s\n", e.what()); std::exit(1);
+    }
+}
+
 void FSTEngine::generate(const std::vector<int>& token_ids, int mt, float temperature, float top_p,
                          void(*cb)(int,const char*,void*), void* u) {
+    if (config_.arch == ARCH_HY3) {                 /* HY3 has its own host-first path */
+        generate_hy3(token_ids, mt, temperature, top_p, cb, u);
+        return;
+    }
     int N = mt > 0 ? mt : 3;
 
     std::vector<bf16_t, AlignedAllocator<bf16_t>> hidden;

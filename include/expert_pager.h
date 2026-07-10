@@ -133,6 +133,14 @@ public:
     long misses()    const { return stat_misses_.load(); }
     long prefetched()const { return stat_prefetch_.load(); }
     long draft_prefetch() const { return stat_draft_prefetch_.load(); }
+    /* SSD-stall accounting: time spent in get()'s slow path (waiting on an
+     * in-flight load or a reactive miss).  hit_rate is misleading because a
+     * miss that later succeeds still counts as a hit; wait_us / wait_count
+     * are the real "did the SSD stall?" signal. */
+    long wait_us()    const { return stat_wait_us_.load(); }
+    long wait_count() const { return stat_wait_count_.load(); }
+    long max_wait_us()const { return stat_max_wait_us_.load(); }
+    int  prefetch_ahead() const { return prefetch_ahead_; }
     double hit_rate() const {
         long g = stat_gets_.load();
         return g ? (double)stat_hits_.load() / (double)g : 0.0;
@@ -176,12 +184,23 @@ private:
     std::thread           worker_;
     std::atomic<bool>     running_{true};
 
+    /* ── Prefetch lead ────────────────────────────────────────────── */
+    /*  How many layers ahead to queue (Markov: same expert ids).  Set from
+     *  FST_PREFETCH_AHEAD env (default 1).  The SSD worker reads ~80 ms/layer
+     *  while decode compute is ~125 ms/layer, so a 2-3 layer head start lets
+     *  reads finish before get() needs them.  0 = no predictive prefetch
+     *  (reactive miss-path only) = the old baseline.                       */
+    int                   prefetch_ahead_{1};
+
     /* ── Statistics (lock-free) ──────────────────────────────────── */
     std::atomic<long> stat_gets_{0};
     std::atomic<long> stat_hits_{0};
     std::atomic<long> stat_misses_{0};
     std::atomic<long> stat_prefetch_{0};
     std::atomic<long> stat_draft_prefetch_{0};
+    std::atomic<long> stat_wait_us_{0};      /* total us spent in get() slow path */
+    std::atomic<long> stat_wait_count_{0};   /* # of gets that took the slow path */
+    std::atomic<long> stat_max_wait_us_{0};  /* worst single get() wait (us) */
 
     /* ── Draft-driven prefetch: router weights for CPU routing ──── */
     /*  Non-owning pointers — caller (FSTEngine) keeps data alive.    */

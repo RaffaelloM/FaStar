@@ -167,3 +167,31 @@ extern "C" void mla_zero(bfloat16 *C)
 {
     zero_accum<8 * 64>(C);
 }
+
+// ============================================================================
+// QK scale: multiply each of the 8*64 output bf16s by 1/sqrt(K_full_dim).
+// (Ported from fst_mla_unified_kernel.cc so the unified xclbin's qk/sv
+//  runtime_sequences can bind mla_qk_scale / mla_sv_scale, which the row-major
+//  fixed kernel lacked.  The scale step is layout-independent.)
+// ============================================================================
+extern "C" void mla_qk_scale(bfloat16 *__restrict data, int32_t K_full_dim)
+{
+    event0();
+    constexpr int VEC = 64;
+    constexpr int TOTAL = 8 * 64;
+    float scale_f = 1.0f / __builtin_aie2p_sqrtf((float)K_full_dim);
+    aie::vector<bfloat16, VEC> scale_vec = aie::broadcast<bfloat16, VEC>((bfloat16)scale_f);
+    for (int i = 0; i < TOTAL; i += VEC) {
+        aie::vector<bfloat16, VEC> v = aie::load_v<VEC>(data + i);
+        v = aie::mul(v, scale_vec).to_vector<bfloat16>();
+        aie::store_v(data + i, v);
+    }
+    event1();
+}
+
+// SV scale: identity (kept for symmetry with the qk pipeline).
+extern "C" void mla_sv_scale(bfloat16 *__restrict data, int32_t D)
+{
+    (void)data;
+    (void)D;
+}

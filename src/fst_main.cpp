@@ -210,26 +210,60 @@ public:
         nlohmann::json j;
         f >> j;
 
-        auto& vocab = j["model"]["vocab"];
-        int max_id = 0;
-        for (auto it = vocab.begin(); it != vocab.end(); ++it) {
-            int id = it.value();
-            vocab_[it.key()] = id;
-            if (id >= (int)id2str_.size()) id2str_.resize(id + 1);
-            id2str_[id] = it.key();
-            if (id > max_id) max_id = id;
-        }
+        /* Parse defensively: tokenizer.json formats vary — DeepSeek stores
+         * merges as space-joined STRINGS, Hunyuan as 2-element ARRAYS; some
+         * omit added_tokens.  A parse hiccup must NOT kill the engine: the HF
+         * tokenizers bridge (hf_encode) is authoritative for encoding, and
+         * decode only needs id2str_.  Catch + warn so the run continues. */
+        try {
+            auto& vocab = j["model"]["vocab"];
+            int max_id = 0;
+            for (auto it = vocab.begin(); it != vocab.end(); ++it) {
+                int id = it.value();
+                vocab_[it.key()] = id;
+                if (id >= (int)id2str_.size()) id2str_.resize(id + 1);
+                id2str_[id] = it.key();
+                if (id > max_id) max_id = id;
+            }
 
-        auto& merges = j["model"]["merges"];
-        for (auto& m : merges) {
-            std::string s = m.get<std::string>();
-            size_t sp = s.find(' ');
-            if (sp != std::string::npos)
-                merges_.push_back({s.substr(0, sp), s.substr(sp + 1)});
-        }
+            auto& merges = j["model"]["merges"];
+            for (auto& m : merges) {
+                std::string a, b;
+                if (m.is_string()) {                 /* DeepSeek: "a b" */
+                    std::string s = m.get<std::string>();
+                    size_t sp = s.find(' ');
+                    if (sp != std::string::npos) { a = s.substr(0, sp); b = s.substr(sp + 1); }
+                } else if (m.is_array() && m.size() == 2) {   /* Hunyuan: ["a","b"] */
+                    a = m[0].get<std::string>(); b = m[1].get<std::string>();
+                } else continue;
+                merges_.push_back({a, b});
+            }
 
-        fprintf(stderr, "  [tokenizer] loaded: %zu vocab, %zu merges, max_id=%d\n",
-                vocab_.size(), merges_.size(), max_id);
+            /* added_tokens (special tokens past the base vocab, e.g. Hunyuan
+             * ids 120000+): register in id2str_ so decode() covers the full
+             * vocab, and in vocab_ so the lossy C++ encode fallback emits them
+             * instead of byte-coding them to id 0. */
+            size_t n_added = 0;
+            if (j.contains("added_tokens")) {
+                for (auto& at : j["added_tokens"]) {
+                    if (!at.is_object()) continue;
+                    int id = at.value("id", -1);
+                    std::string content = at.value("content", std::string());
+                    if (id < 0 || content.empty()) continue;
+                    if (id >= (int)id2str_.size()) id2str_.resize(id + 1);
+                    id2str_[id] = content;
+                    vocab_[content] = id;
+                    if (id > max_id) max_id = id;
+                    ++n_added;
+                }
+            }
+
+            fprintf(stderr, "  [tokenizer] loaded: %zu vocab, %zu merges, %zu "
+                    "added, max_id=%d\n", vocab_.size(), merges_.size(), n_added, max_id);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "  [tokenizer] WARN: partial parse (%s); encode "
+                    "will use the HF bridge, decode may miss some ids\n", e.what());
+        }
 
         /* Build the reverse byte_to_unicode map (codepoint -> original byte)
          * used by decode() to invert the ByteLevel encoding. */
@@ -742,15 +776,23 @@ int main(int argc, char** argv) {
     /* --kernel_dir / FST_KERNEL_DIR: where the _insts.bin / .xclbin live. */
     if (!args.kernel_dir.empty()) setenv("FST_KERNEL_DIR", args.kernel_dir.c_str(), 1);
 
-    /* ExpertPager RAM cache is now a TRANSIENT SSD-load staging area (6 GB):
-     * the authoritative expert cache is the 20 GB persistent host_only BO
-     * cache in FSTEngine (get_expert_bo), which holds all 1376 experts
-     * device-readable and is checked BEFORE the pager on every dispatch.
-     * Keeping the pager small avoids storing each expert TWICE (pager vector
-     * + BO) — the 2x duplication that OOM'd the process under a cgroup cap.
-     * 6 GB stages ~450 experts concurrently, enough for the background
-     * prefetch worker; a BO miss re-loads from SSD via this staging area. */
-    FSTEngine engine(args.model, 6000);
+    /* ExpertPager RAM cache.  Default 6 GB (a TRANSIENT SSD-load staging area
+     * for the per-op path, where the authoritative expert cache is the
+     * host_only BO cache in get_expert_bo, checked BEFORE the pager — keeping
+     * the pager small avoids the 2x pager+BO duplication that OOM'd under a
+     * cgroup cap).
+     *
+     * For the FUSED HY3 path (FST_HY3_FUSED_FFN), the FFN pack bypasses
+     * get_expert_bo and reads directly from the pager's Expert structs, so the
+     * pager is the ONLY expert cache — a 6 GB pager holds ~600 experts ≈ one
+     * token (80×8=640), giving zero cross-token reuse.  FST_RAM_CACHE_GB raises
+     * it (e.g. 20 GB ≈ 2000 experts ≈ 3 tokens) to capture cross-token reuse;
+     * the fused path has no 2x BO duplication, so RSS stays ~40 GB on a 60 GB
+     * box.  60 GB RAM, ~55 GB available — see HY3_FUSED_FFN_POSTMORTEM. */
+    size_t ram_mb = 6000;
+    if (const char *e = std::getenv("FST_RAM_CACHE_GB"))
+        ram_mb = (size_t)std::strtoul(e, nullptr, 10) * 1024ULL;
+    FSTEngine engine(args.model, ram_mb);
 
     fprintf(stderr, "\nModel configuration:\n");
     fprintf(stderr, "  Layers    : %d\n", engine.config_.n_layers);
@@ -794,10 +836,26 @@ int main(int argc, char** argv) {
      * (it may emit a stray thinking token or drift); "</think>" forces a
      * direct non-reasoning answer, which is what an instruction-tuned
      * assistant should produce for a plain prompt. */
+    /* HY3 (Hunyuan-3.0): apply the official no_think chat template (single user
+     * turn, no tools) — BOS + <reasoning_mode> + "reasoning_effort:no_think" +
+     * User + prompt + Assistant + empty <think></think>.  Mirrors HF's
+     * apply_chat_template (chat_template.jinja); the HF bridge recognizes the
+     * special tokens as their single IDs.  DeepSeek stays on its own template
+     * (its special tokens are NOT in the HY3 vocab and vice-versa). */
+    const bool hy3_raw = (engine.config_.arch == ARCH_HY3) && std::getenv("FST_HY3_RAW_PROMPT");
     const std::string chat_prompt =
-        std::string("<｜begin▁of▁sentence｜><｜User｜>") + args.prompt +
-        std::string("<｜Assistant｜></think>");
-    fprintf(stderr, "  [chat-template] wrapped prompt (%zu bytes)\n",
+        (engine.config_.arch == ARCH_HY3)
+        ? (hy3_raw ? args.prompt
+           : (std::string("<｜hy_begin_of_sentence:opensource｜>") +
+              std::string("<｜reasoning_mode:opensource｜>reasoning_effort:no_think") +
+              std::string("<｜hy_User:opensource｜>") + args.prompt +
+              std::string("<｜hy_Assistant:opensource｜>") +
+              std::string("<think:opensource></think:opensource>")))
+        : std::string("<｜begin▁of▁sentence｜><｜User｜>") + args.prompt +
+        std::string("<｜Assistant｜>\n");
+    fprintf(stderr, "  [chat-template] %s (%zu bytes)\n",
+            hy3_raw ? "RAW HY3 prompt (test bypass)"
+                    : (engine.config_.arch == ARCH_HY3 ? "templated HY3 prompt" : "wrapped DS4 prompt"),
             chat_prompt.size());
 
     /* Encode via the HF tokenizers bridge (correct ByteLevel BPE).  Fall back

@@ -4,9 +4,16 @@ build-*/
 __pycache__/
 *.pyc
 
+# IRON / MLIR-AIE kernel build intermediates (regeneratable from kernels/compile_*.py)
+*.o
+*.mlir
+*.prj/
+
 # Model files + sidecars + tokenizer (auto-downloaded from HuggingFace on first run)
 *.fst
 *.fst.*
+*.gguf
+*.gguf.*
 tokenizer.json
 main_*.bin
 

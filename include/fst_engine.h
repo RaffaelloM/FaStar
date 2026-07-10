@@ -112,6 +112,16 @@ struct KVCacheEntry {
     xrt::bo k_pe_bo;
 };
 
+/* ── Hunyuan-3.0 (HY3) GQA KV cache ───────────────────────────────────────
+ * Uncompressed (HY3 is GQA, NOT MLA): per layer, num_kv_heads (8) × head_dim
+ * (128) K and V rows, one per cached position.  bf16.  n = #cached positions.
+ * Append-only within a generation; reset in reset_session(). */
+struct Hy3KVCache {
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> k;  /* [max_seq, num_kv*hd] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> v;  /* [max_seq, num_kv*hd] */
+    int n = 0;
+};
+
 /* V4 KV-compressor per-layer state (ds4.c attn_state_kv / attn_state_score /
  * attn_comp_kv).  state_kv/state_sc are [2*ratio, comp_width] for ratio=4
  * (two-lane: rows [0,ratio)=primary prev-window, [ratio,2*ratio)=secondary
@@ -124,7 +134,16 @@ struct CompressorState {
     int n_comp = 0;
 };
 
+/* Model architecture the loaded .fst was built for.  Drives the per-layer
+ * path branch in fst_engine.cpp: ARCH_DS4 = DeepSeek V4 Flash (MLA latent
+ * compression + sqrtsoftplus router + hash routing + DSpark); ARCH_HY3 =
+ * Tencent Hunyuan-3.0 (GQA + sigmoid+bias router + dense L0 + always-on
+ * shared expert + NextN MTP).  Detected from the FSTH header in the ctor
+ * (qh=64 && kh=8 && hd2=128 ⇒ HY3) and unpacked from the reserved r1/r2. */
+enum Arch { ARCH_DS4, ARCH_HY3 };
+
 struct ModelConfig {
+    Arch arch = ARCH_DS4;
     int n_layers = 0;
     int n_experts = 0;
     int top_k = 0;
@@ -135,7 +154,7 @@ struct ModelConfig {
     size_t expert_block_bytes = 0;
     /* DeepSeek-V4 FFN/router params (from config.json; hardcoded defaults
      * match the HF checkpoint so no .fst reconversion is needed). */
-    float swiglu_limit = 10.0f;   /* Expert SwiGLU clamp: gate<=lim, up∈±lim (model.py 605-607) */
+    float swiglu_limit = 10.0f;   /* Expert SwiGlU clamp: gate<=lim, up∈±lim (model.py 605-607) */
     int n_hash_layers = 3;        /* L0..L2 use tid2eid hash routing (model.py 561) */
     float route_scale = 1.5f;     /* routed_scaling_factor: weights*=route_scale after
                                    * normalize-to-sum-1 (model.py 588, config.json
@@ -146,6 +165,23 @@ struct ModelConfig {
      * 0 = plain MLA (L0-1, L41-42); 4 = attention compressor w/ two-lane pool
      * (even L2..L40); 128 = odd L3..L39 (deferred — emits no rows for S<128). */
     std::vector<int> compress_ratios;
+    /* ── Hunyuan-3.0 (HY3) fields — unpacked from FSTH r1/r2 + qh/kh/hd2/id ──
+     * GQA attention: num_q_heads Q heads, num_kv_heads KV heads (8:1 group),
+     * head_dim each.  first_k_dense_replace: layers [0,first_k_dense_replace)
+     * run a dense SwiGLU FFN (dense_inter_dim), the rest run MoE.  The router
+     * uses expert_gating_func (2 = sigmoid) + per-expert bias; the selected
+     * (unbiased) weights are Σ-normalized then × expert_weights_scale.
+     * YaRN RoPE: rope_scaling_factor (4.0) over yarn_orig_ctx (262144). */
+    int num_q_heads = 0;            /* 64 */
+    int num_kv_heads = 0;           /* 8 */
+    int head_dim = 0;               /* 128 */
+    int expert_inter_dim = 0;       /* 1536 (routed + shared expert FFN inter) */
+    int dense_inter_dim = 0;        /* 13312 (L0 dense FFN inter) */
+    int first_k_dense_replace = 0;  /* 1 */
+    int expert_gating_func = 0;     /* 2 = sigmoid */
+    float expert_weights_scale = 1.0f; /* 2.826 (route_norm × scale) */
+    float rope_scaling_factor = 0.0f;  /* 4.0 YaRN */
+    int yarn_orig_ctx = 0;          /* 262144 */
 };
 
 /* DSpark draft model config (from .fst header reserved fields) */
@@ -199,6 +235,43 @@ struct ModelWeightsC {
     std::vector<bf16_t, AlignedAllocator<bf16_t>> hc_head_fn;
     std::vector<float> hc_head_scale, hc_head_base;
     ~ModelWeightsC();
+};
+
+/* ── Hunyuan-3.0 (HY3) per-layer weights ────────────────────────────────
+ * Read at their ACTUAL stored dims from the shared-bank directory entries
+ * (NOT the DS4 MLA hardcoded 1024/512).  All matrices are BF16 stored native
+ * [out,in] = [N,K] row-major so the b_col_maj GEMM kernels (expert_gemm_vec)
+ * read them directly (NO transpose).  router + router_bias are F32; the
+ * router is transposed [n_experts,hidden]→[hidden,n_experts] at load to match
+ * router_gemm's [K,N] B layout (same convention as DS4).  Expert FFN weights
+ * are NOT here — they live in the MXFP4 expert bank (header-driven eb/es).
+ * Dense (L0) and NextN (L80) tensors are left empty on the layers that don't
+ * own them.  Device BOs / preloading are added in later phases. */
+struct Hy3LayerWeights {
+    /* attention (every layer 0..80): GQA 64Q / 8KV @ head_dim 128 */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> attn_norm;   /* [hidden]      TID_INPUT_NORM */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> q_proj;      /* [num_q*hd, hidden] = [8192,4096] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> k_proj;      /* [num_kv*hd, hidden] = [1024,4096] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> v_proj;      /* [num_kv*hd, hidden] = [1024,4096] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> o_proj;      /* [hidden, num_q*hd] = [4096,8192] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> q_norm;      /* [head_dim=128] per-head Q RMSNorm */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> k_norm;      /* [head_dim=128] per-head K RMSNorm */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> ffn_norm;   /* [hidden]      TID_POST_ATTN_NORM */
+    /* MoE router (layers 1..79): sigmoid + per-expert bias */
+    std::vector<float> router;        /* [hidden, n_experts] F32 AFTER transpose ([K,N] for router_gemm) */
+    std::vector<float> router_bias;   /* [n_experts=192] F32 (exp_probs_b) */
+    /* always-on shared expert (layers 1..79): BF16 native [out,in] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> shared_gate, shared_up; /* [1536,4096] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> shared_down;           /* [4096,1536] */
+    /* dense L0 FFN (layer 0 only): BF16 native [out,in], inter 13312 */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> dense_gate, dense_up; /* [13312,4096] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> dense_down;           /* [4096,13312] */
+    /* NextN MTP (layer 80 only): eh_proj + 3 norms (blk.80 is a full GQA+MoE block).
+     * eh_proj maps concat(e_norm,h_norm) [2*hidden] → hidden, stored [out,in]=[hidden,2*hidden]=[4096,8192]. */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> nextn_eh_proj;         /* [4096,8192] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> nextn_enorm;          /* [hidden] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> nextn_hnorm;          /* [hidden] */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> nextn_shared_head_norm; /* [hidden] */
 };
 
 /* Draft model shared weights per stage (mirrors LayerWeightsC but lighter) */
@@ -262,10 +335,17 @@ public:
     ModelConfig config_;
     DraftConfig draft_cfg_;
     std::vector<LayerWeightsC> shared_;
+    std::vector<Hy3LayerWeights> hy3_shared_;   /* ARCH_HY3 per-layer GQA+MoE weights */
     ModelWeightsC model_;
     FSTEngine(const std::string& fst_path,size_t cache_mb=6000);
     ~FSTEngine();
     void generate(const std::vector<int>&,int,float,float=0.9f,void(*)(int,const char*,void*)=nullptr,void*u=nullptr);
+    /* ARCH_HY3 greedy autoregressive path (--no-sd): prefill prompt through the
+     * trunk (blk.0..n_layers-2, excluding the MTP block) → output_norm → shared
+     * lm_head → argmax; decode one token/step the same way.  Host-first (reuses
+     * process_gqa/process_ffn_hy3 + host final_norm/lm_head).  No draft/MTP. */
+    void generate_hy3(const std::vector<int>&,int,float,float=0.9f,
+                      void(*)(int,const char*,void*)=nullptr,void*u=nullptr);
     /* DSpark speculative decoding: load draft model, run SD loop */
     void load_draft_model(const std::string& draft_fst_path);
     void generate_dspark(const std::vector<int>&,int,float,float=0.9f,
@@ -293,6 +373,13 @@ public:
     int  seq_pos() const { return seq_pos_; }
 private:
     void load_shared_weights(const std::string&);
+    /* ARCH_HY3 path: TID-based loader (NOT the DS4 shape-keyed map, which
+     * collides on HY3's k_proj/v_proj "1024x4096x1" and attn/ffn_norm
+     * "4096x1x1").  Reads each shared-bank tensor by (tid,lid), interprets
+     * the entry qtype directly (BF16=2 raw 2-byte, F32=3 raw 4-byte — HY3's
+     * shared bank has NO Q8_0), and transposes only the router.  Sets
+     * hy3_shared_ + the model_ globals (embed/lm_head/final_norm). */
+    void load_hy3_shared_weights(const std::string&);
     /* Load ONLY the Hybrid Connection weights (TIDs 23-31) from a tiny
      * <model>.fst.hc sidecar produced by `fst_converter.py hc`.  Mirrors the
      * inline HC reads in load_shared_weights but against a separate file, so
@@ -307,6 +394,45 @@ private:
     void init_device();
     void process_layer(int,bf16_t*,int,const int* input_ids=nullptr);
     void process_mla(int,bf16_t*,int);
+    /* ARCH_HY3 GQA attention (replaces process_mla): RMSNorm → q/k/v proj GEMM
+     * (host-first for correctness; heavy proj GEMMs move to NPU qck/ob in a
+     * later speed sub-phase) → per-head Q/K RMSNorm (d=head_dim) → YaRN RoPE
+     * (NeoX rotate-half, base 11158840, factor 4.0, orig 262144, mscale folded
+     * into cos/sin) → append to uncompressed 8×128 KV cache → causal QK·1/√128
+     * → softmax → V → o proj → residual add.  h is [M, hidden] in/out; the
+     * attention output is ADDED to h (residual). */
+    void process_gqa(int, bf16_t*, int);
+    /* ARCH_HY3 FFN: dense SwiGLU for L0 (first_k_dense_replace), MoE+shared for
+     * the rest (router → 8 routed experts + always-on shared, residual add). */
+    void process_ffn_hy3(int, bf16_t*, int);
+    /* ARCH_HY3 routed-expert FFN (host-first): dequant the (lid,e) MXFP4 expert
+     * block from the pager and run SwiGLU for each selected expert, weighting
+     * into acc[M,hd].  eids/wts are [M*top_k]. */
+    void process_expert_ffn_hy3(int lid, const bf16_t* h, float* acc, int M,
+                                const int* eids, const float* wts);
+    /* ARCH_HY3 routed-expert FFN — DISPATCH-COLLAPSED (NPU-autonomous) variant.
+     * Packs all ≤8 router-selected experts' MXFP4 into one 80 MB BO, dequants
+     * them in ONE dispatch (hy3_dequant_8exp → 302 MB expert-major [E,3,N,K] BO),
+     * then runs the gate/up/silu/mul/down chain as 5 batched multi-core
+     * dispatches (8 cores, 1 expert/core) over the whole batch — vs 6
+     * dispatches PER expert in the per-op path (48/layer).  Single host flush
+     * per cross-context boundary.  Behind the FST_HY3_FUSED_FFN ctor guard. */
+    void process_expert_ffn_hy3_fused(int lid, const bf16_t* h, float* acc, int M,
+                                      const int* eids, const float* wts);
+    /* ARCH_HY3 NextN MTP head (blk.80, replaces DSpark draft).  Host-first.
+     *   forward_nextn_step: one draft step — embed(last_id) → enorm/hnorm →
+     *     eh_proj{2*hidden→hidden} → blk.80 GQA+MoE (own KV at hy3_kv_cache_[80],
+     *     seq_pos_=step) → shared_head_norm → shared lm_head → argmax draft token.
+     *     h_prev is the previous post-norm hidden (trunk output_norm out, or the
+     *     prior step's h_post — post-norm chaining, HY3 gotcha #6).  Writes
+     *     h_post[hidden] (next step's h_prev) + logits[vocab]; returns draft id.
+     *   forward_nextn_draft: iterate up to n_max steps with p_min cutoff, chaining
+     *     h_post→h_prev, returning DraftResult {tokens, confidence}.  Standalone —
+     *     SD-acceptance wiring + trunk-loop-bound fix (trunk must NOT run blk.80)
+     *     land in the E2E phase; MTP KV seeding/position semantics deferred to the
+     *     fork-validation step. */
+    int  forward_nextn_step(int last_token_id, const bf16_t* h_prev, int step,
+                            bf16_t* h_post, float* logits);
     /* V4 KV compressor: stream one token's attn-normed hidden through the
      * per-layer compressor state; on a ratio boundary emit a 512-dim
      * compressed KV row into cmp_state_[lid].cache.  NPU projects (qc kernel),
@@ -425,6 +551,7 @@ private:
     xrt::device npu_device_;
     std::unique_ptr<AiebuKernelCache> kernel_cache_;
     std::vector<KVCacheEntry> kv_cache_;
+    std::vector<Hy3KVCache> hy3_kv_cache_;     /* ARCH_HY3 per-layer GQA KV cache */
     std::vector<CompressorState> cmp_state_;   /* per-layer V4 compressor state */
     int current_loaded_layer_ = -1;
     int grp_ = 0;
@@ -454,7 +581,16 @@ private:
     // Batched multi-core FFN (FST_MC_FFN): 6-expert batched B in 3x-stride
     // gate|up|down layout, read by fst_expert_gemm_vec_mc (gate/up) and
     // fst_expert_gemm_down_mc (down).  E_MC=6 slots x 3 x proj_elems = 302 MB.
+    // HY3 fused (FST_HY3_FUSED_FFN) reuses this same 302 MB BO — the 8-expert
+    // dequant output is the identical expert-major [E,3,N,K] layout (8*3*4096*
+    // 1536*2 = 301,989,888 B == DS4's 6*3*4096*2048*2), so the HY3 MC kernels
+    // read it via the same sub-buffer base shifts (+proj_sz for up, +2*proj_sz
+    // for down).
     xrt::bo bo_batch_w_;
+    // HY3 fused-FFN: packed MXFP4 input for the 8-expert dequant (host_only,
+    // 8*10,027,008 = 80,216,064 B).  Repacked from get_expert_bo each layer.
+    xrt::bo bo_fused_weight_;
+    bool   hy3_fused_ffn_ = false;   // ctor guard: FST_HY3_FUSED_FFN env set
 
     // ── 4-set FFN scratch BO pool (async pipeline) ───────────────────────
     // A pool of 4 independent scratch sets so that expert E+1's dequant
@@ -497,12 +633,12 @@ private:
     // BO when full (a BO miss re-loads from SSD via the pager).  Main model
     // only (draft uses draft_pager_ with its own 0..2 layer range — kept on
     // the memcpy path to avoid a (lid,e) key collision with the main model).
-    // 20 GB holds all 1376 experts (18 GB) so every dispatch after warmup is a
-    // HIT (no per-dispatch sync_to).  Because the BO cache holds all experts
-    // device-readable, the pager's vector cache is now only a transient SSD-
-    // load staging area (kept small via cache_mb) — it does NOT need to also
-    // cache experts, avoiding a 2x memory duplication (vector + BO).
-    static constexpr size_t EXPERT_BO_CAP = 20ULL * 1024 * 1024 * 1024; // 20 GB
+    // DS4: 20 GB holds all 1376 experts (18 GB) so every dispatch after warmup
+    // is a HIT.  HY3: 15,360 experts = 153 GB — CANNOT fit; the cap is a RAM-
+    // bounded LRU window (default 8 GB ≈ 800 experts) and misses re-load from
+    // SSD.  Overridable via FST_EXPERT_BO_CAP_GB (both arches).  Set in the ctor
+    // after config_.arch is known.
+    size_t expert_bo_cap_ = 20ULL * 1024 * 1024 * 1024; // 20 GB (DS4 default)
     std::unordered_map<CacheKey, xrt::bo, CacheKeyHash> expert_bo_cache_;
     std::list<CacheKey> expert_bo_lru_;        // front = MRU
     size_t expert_bo_bytes_ = 0;
@@ -607,6 +743,12 @@ private:
     };
     DraftResult forward_draft(const bf16_t* main_hidden, int last_token_id,
                                float temperature);
+    /* ARCH_HY3 NextN MTP iterative draft (blk.80): chains forward_nextn_step up
+     * to n_max with a p_min cutoff, returning DraftResult.  See forward_nextn_step
+     * for the per-step math; declared here (after DraftResult) so the return type
+     * is in scope.  Standalone — SD-acceptance wiring lands in the E2E phase. */
+    DraftResult forward_nextn_draft(const bf16_t* h_prev, int last_token_id,
+                                    int n_max, float p_min);
 
     /* SD statistics for post-mortem */
     long sd_total_draft_tokens_ = 0;

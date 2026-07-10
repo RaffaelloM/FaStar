@@ -162,6 +162,22 @@ TID_ATTN_COMPRESSOR_NORM = 35   # [512] BF16
 # ── Global config arrays ────────────────────────────────────────────────
 TID_COMPRESS_RATIOS = 40       # [n_layers] F32 — per-layer compression ratio
 
+# ── Hunyuan-3.0 (hy_v3) specific TIDs ───────────────────────────────────
+# HY3 uses GQA + per-head Q/K RMSNorm + sigmoid router + NextN MTP.  The
+# tensors that map 1:1 to existing TIDs (embed/output_norm/lm_head, the two
+# RMSNorms, Q/K/V/O proj, router, router_bias, shared expert gate/up/down)
+# reuse those TIDs.  HY3-only tensors get fresh TIDs 50+ so the HY3 engine
+# loader is self-documenting and never collides with a DS4/MLA meaning.
+TID_HY3_Q_NORM              = 50   # per-head Q RMSNorm  [head_dim=128] BF16
+TID_HY3_K_NORM              = 51   # per-head K RMSNorm  [head_dim=128] BF16
+TID_HY3_DENSE_GATE          = 52   # dense L0 FFN gate   [inter=13312,hidden] BF16
+TID_HY3_DENSE_UP            = 53   # dense L0 FFN up     [inter=13312,hidden] BF16
+TID_HY3_DENSE_DOWN          = 54   # dense L0 FFN down   [hidden,inter]       BF16
+TID_HY3_NEXTN_EH_PROJ       = 55   # MTP eh_proj         [2*hidden,hidden]    BF16
+TID_HY3_NEXTN_ENORM         = 56   # MTP enorm           [hidden]             BF16
+TID_HY3_NEXTN_HNORM         = 57   # MTP hnorm           [hidden]             BF16
+TID_HY3_NEXTN_SHARED_HEAD_N = 58   # MTP shared_head_norm[hidden]             BF16
+
 GLOBAL_LAYER = 0xFFFF
 
 FP4_LEVELS = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
@@ -708,8 +724,8 @@ def _pack_header(cfg, shared_dir_offset, shared_dir_count,
         int(shared_dir_offset),
         int(shared_dir_count),
         int(expert_bank_offset),
-        int(EXPERT_BLOCK_BYTES),
-        int(EXPERT_BLOCK_STRIDE),
+        int(cfg.get("expert_block_bytes", EXPERT_BLOCK_BYTES)),
+        int(cfg.get("expert_block_stride", EXPERT_BLOCK_STRIDE)),
         int(expert_count_total),
         r1, r2,
     )
@@ -1572,6 +1588,253 @@ def convert_full_model_v4(model_dir, output_path, verbose=False, max_layers=None
     return str(out)
 
 
+# ─── Hunyuan-3.0 (hy_v3) GGUF → .fst ────────────────────────────────────
+#
+# HY3 is GQA (64 Q / 8 KV heads, head_dim 128) with a sigmoid router (+ per-
+# expert bias), per-head Q/K RMSNorm, a single dense layer 0 (first_k_dense
+# replace=1), 192 routed experts (top-8, expert_dim 1536) + 1 shared expert,
+# and a NextN MTP head stored as blk.80 (a full MoE block + 4 nextn tensors).
+# Experts are Q3_K_M in the GGUF; we dequant → float32 → requantize to the
+# existing 17-byte MXFP4 dense-block layout via _float32_to_dense_blocks, so
+# the expert bank is byte-compatible with the DS4 NPU dequant kernel.
+#
+# HY3 expert geometry (expert_dim 1536, hidden 4096):
+#   gate/up: [out=1536, in=4096]  → 1536*128*17 = 3,342,336 B
+#   down   : [out=4096, in=1536]  → 4096* 48*17 = 3,342,336 B
+#   block  = gate + up + down     =            10,027,008 B  (already 4096-aligned)
+
+
+def _gguf_get(reader, key, default=None):
+    """Read a scalar GGUF metadata KV field via the gguf library."""
+    import gguf as _g
+    f = reader.fields.get(key)
+    if f is None or not f.parts:
+        return default
+    vt = f.types[-1] if f.types else None
+    arr = f.parts[-1]
+    if vt == _g.GGUFValueType.STRING:
+        return bytes(arr).decode("utf-8", "replace")
+    if vt == _g.GGUFValueType.BOOL:
+        return bool(int(np.asarray(arr).ravel()[0]))
+    if arr.size == 1:
+        return arr.item()
+    return np.asarray(arr).ravel()
+
+
+def _gguf_dequant(t):
+    """Dequantize a GGUFReader tensor to float32 in ggml element order,
+    reshaped to tuple(reversed(shape)) — i.e. [out, in] for 2-D linear
+    weights and [n_experts, out, in] for the 3-D expert tensors.  This is
+    the layout _float32_to_dense_blocks expects (B[N=out, K=in] row-major)."""
+    import gguf as _g
+    out = _g.quants.dequantize(t.data, t.tensor_type)
+    out = np.ascontiguousarray(out, dtype=np.float32).ravel()
+    return out.reshape(tuple(int(d) for d in reversed(t.shape)))
+
+
+def _hy3_expert_block_bytes(expert_dim, hidden):
+    g = (expert_dim * hidden // DENSE_BLOCK_ELEMS) * DENSE_BLOCK_BYTES
+    u = g
+    d = (hidden * expert_dim // DENSE_BLOCK_ELEMS) * DENSE_BLOCK_BYTES
+    return g + u + d
+
+
+def convert_hy3(gguf_path, output_path, verbose=False):
+    """Convert a Hunyuan-3.0 (hy_v3) GGUF file to a .fst with MXFP4 experts."""
+    import gguf
+    t_start = time.time()
+    gguf_path = Path(gguf_path)
+
+    print(f"Opening GGUF (mmap): {gguf_path}")
+    reader = gguf.GGUFReader(str(gguf_path))
+    arch = _gguf_get(reader, "general.architecture", "")
+    if arch != "hy_v3":
+        raise ValueError(f"not a hy_v3 GGUF (general.architecture={arch!r})")
+    n_blk = int(_gguf_get(reader, "hy_v3.block_count", 81))
+
+    # ── Name → tensor map (built once; shapes are the raw GGUF dims) ──
+    tmap = {t.name: t for t in reader.tensors}
+
+    # ── Hyperparameters from GGUF metadata (with inspected-value fallbacks) ──
+    cfg = {
+        "hidden_dim":           int(_gguf_get(reader, "hy_v3.embedding_length", 4096)),
+        "num_layers":           n_blk,                       # blk.0..80 = 81
+        "num_experts":          int(_gguf_get(reader, "hy_v3.expert_count", 192)),
+        "top_k":                int(_gguf_get(reader, "hy_v3.expert_used_count", 8)),
+        "num_q_heads":          int(_gguf_get(reader, "hy_v3.attention.head_count", 64)),
+        "num_kv_heads":         int(_gguf_get(reader, "hy_v3.attention.head_count_kv", 8)),
+        "head_dim":             int(_gguf_get(reader, "hy_v3.attention.key_length", 128)),
+        "expert_inter_dim":     int(_gguf_get(reader, "hy_v3.expert_feed_forward_length", 1536)),
+        "num_shared_experts":   1,
+        "vocab_size":           int(tmap["token_embd.weight"].shape[1]),   # [hidden, vocab]
+        "rms_eps":              float(_gguf_get(reader, "hy_v3.attention.layer_norm_rms_epsilon", 1e-5)),
+        "rope_freq_base":       float(_gguf_get(reader, "hy_v3.rope.freq_base", 11158840.0)),
+    }
+    # HY3 architecture constants not in the standard header fields, packed
+    # into the reserved r1/r2 u64 slots (which _pack_header builds from the
+    # dspark_* cfg keys) so the engine HY3 path can read them without a
+    # header struct change:
+    #   r1 low16  = first_k_dense_replace   (via dspark_block_size)
+    #   r1 high16 = expert_gating_func      (via dspark_markov_rank)
+    #   r2 high32 = int(rope.scaling.factor*1000)
+    #   r2 low32  = int(expert_weights_scale*1e6)        (via dspark_noise_token_id)
+    first_k_dense = 1
+    gating_func = int(_gguf_get(reader, "hy_v3.expert_gating_func", 2))
+    yarn_factor = float(_gguf_get(reader, "hy_v3.rope.scaling.factor", 4.0))
+    ew_scale = float(_gguf_get(reader, "hy_v3.expert_weights_scale", 2.826))
+    cfg["dspark_block_size"] = first_k_dense & 0xFFFF
+    cfg["dspark_markov_rank"] = gating_func & 0xFFFF
+    cfg["dspark_noise_token_id"] = (int(round(yarn_factor * 1000)) << 32) | int(round(ew_scale * 1e6))
+
+    hidden = cfg["hidden_dim"]
+    n_exp = cfg["num_experts"]
+    expert_dim = cfg["expert_inter_dim"]
+    ebb = _hy3_expert_block_bytes(expert_dim, hidden)
+    ebs = align_up(ebb, PAGE)
+    cfg["expert_block_bytes"] = ebb
+    cfg["expert_block_stride"] = ebs
+    print(f"HY3: {n_blk} blocks (L0 dense + L1..{n_blk-2} MoE + L{n_blk-1} MTP), "
+          f"{n_exp} experts top-{cfg['top_k']}, hidden={hidden}, expert_dim={expert_dim}, "
+          f"GQA {cfg['num_q_heads']}/{cfg['num_kv_heads']} @ {cfg['head_dim']}, vocab={cfg['vocab_size']}")
+    print(f"  expert block = {ebb:,} B (stride {ebs:,}), gating={gating_func} sigmoid, "
+          f"first_k_dense={first_k_dense}, yarn={yarn_factor}, ew_scale={ew_scale}")
+
+    def deq(name):
+        t = tmap.get(name)
+        if t is None:
+            raise KeyError(f"missing GGUF tensor {name!r}")
+        return _gguf_dequant(t)
+
+    def has(name):
+        return name in tmap
+
+    # ── Shared tensor entries: (tid, layer, sub, qtype, float32_array) ──
+    shared_entries = []  # noqa: shadows outer in this fn scope
+
+    # Globals
+    shared_entries.append((TID_EMBED,       GLOBAL_LAYER, 0, QTYPE_BF16, deq("token_embd.weight")))
+    shared_entries.append((TID_OUTPUT_NORM, GLOBAL_LAYER, 0, QTYPE_BF16, deq("output_norm.weight")))
+    shared_entries.append((TID_LM_HEAD,     GLOBAL_LAYER, 0, QTYPE_BF16, deq("output.weight")))
+
+    mtp_layer = n_blk - 1  # blk.80
+    for L in range(n_blk):
+        b = f"blk.{L}."
+        # every block has GQA attention + the two RMSNorms + per-head Q/K norm
+        shared_entries.append((TID_INPUT_NORM,      L, 0, QTYPE_BF16, deq(b + "attn_norm.weight")))
+        shared_entries.append((TID_Q_PROJ,          L, 0, QTYPE_BF16, deq(b + "attn_q.weight")))
+        shared_entries.append((TID_K_PROJ,          L, 0, QTYPE_BF16, deq(b + "attn_k.weight")))
+        shared_entries.append((TID_V_PROJ,          L, 0, QTYPE_BF16, deq(b + "attn_v.weight")))
+        shared_entries.append((TID_O_PROJ,          L, 0, QTYPE_BF16, deq(b + "attn_output.weight")))
+        shared_entries.append((TID_HY3_Q_NORM,      L, 0, QTYPE_BF16, deq(b + "attn_q_norm.weight")))
+        shared_entries.append((TID_HY3_K_NORM,      L, 0, QTYPE_BF16, deq(b + "attn_k_norm.weight")))
+        shared_entries.append((TID_POST_ATTN_NORM,  L, 0, QTYPE_BF16, deq(b + "ffn_norm.weight")))
+
+        if L == 0:
+            # dense FFN (intermediate = feed_forward_length 13312)
+            shared_entries.append((TID_HY3_DENSE_GATE, L, 0, QTYPE_BF16, deq(b + "ffn_gate.weight")))
+            shared_entries.append((TID_HY3_DENSE_UP,   L, 0, QTYPE_BF16, deq(b + "ffn_up.weight")))
+            shared_entries.append((TID_HY3_DENSE_DOWN, L, 0, QTYPE_BF16, deq(b + "ffn_down.weight")))
+        else:
+            # MoE: sigmoid router + per-expert bias + shared expert
+            shared_entries.append((TID_ROUTER,       L, 0, QTYPE_F32, deq(b + "ffn_gate_inp.weight")))
+            shared_entries.append((TID_ROUTER_BIAS,  L, 0, QTYPE_F32, deq(b + "exp_probs_b")))
+            shared_entries.append((TID_SHARED_GATE,  L, 0, QTYPE_BF16, deq(b + "ffn_gate_shexp.weight")))
+            shared_entries.append((TID_SHARED_UP,    L, 0, QTYPE_BF16, deq(b + "ffn_up_shexp.weight")))
+            shared_entries.append((TID_SHARED_DOWN,  L, 0, QTYPE_BF16, deq(b + "ffn_down_shexp.weight")))
+
+        if L == mtp_layer:
+            shared_entries.append((TID_HY3_NEXTN_EH_PROJ,      L, 0, QTYPE_BF16, deq(b + "nextn.eh_proj.weight")))
+            shared_entries.append((TID_HY3_NEXTN_ENORM,        L, 0, QTYPE_BF16, deq(b + "nextn.enorm.weight")))
+            shared_entries.append((TID_HY3_NEXTN_HNORM,        L, 0, QTYPE_BF16, deq(b + "nextn.hnorm.weight")))
+            shared_entries.append((TID_HY3_NEXTN_SHARED_HEAD_N, L, 0, QTYPE_BF16, deq(b + "nextn.shared_head_norm.weight")))
+
+    print(f"  shared entries: {len(shared_entries)}")
+
+    # ── Write .fst: header reserve → shared data → dir → expert bank ───
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shared_dir_offset = align_up(HEADER_SIZE)
+    shared_dir_count = len(shared_entries)
+    data_offset = align_up(shared_dir_offset + shared_dir_count * SHARED_ENTRY_SIZE)
+
+    with open(out, "wb") as f:
+        f.write(b"\x00" * data_offset)
+
+        dir_entries = []
+        for i, (tid, lid, sub_id, qtype, t) in enumerate(_tqdm(shared_entries, desc="Shared data")):
+            shape = _shape_of(t)
+            ndim = len(shape)
+            shape3 = (shape + (1, 1, 1))[:3]
+            data = _quant_shared(t, qtype)
+            data_off = align_up(f.tell())
+            f.seek(data_off)
+            f.write(data)
+            dir_entries.append(struct.pack(
+                SHARED_ENTRY_FMT,
+                tid, lid, sub_id, qtype, ndim, 0,
+                int(shape3[0]), int(shape3[1]), int(shape3[2]),
+                int(data_off), int(len(data)), 0,
+            ))
+            shared_entries[i] = None
+        shared_entries = None
+        gc.collect()
+
+        after_shared = align_up(f.tell())
+        f.seek(shared_dir_offset)
+        f.write(b"".join(dir_entries))
+        del dir_entries
+
+        # ── Expert bank: layers 1..mtp_layer (MoE), 192 experts each ──
+        # Layer 0 is dense → its 192 bank slots are left sparse (never read).
+        expert_bank_offset = after_shared
+        moe_layers = [L for L in range(1, n_blk)]  # 1..80
+        n_written = 0
+        print(f"\nExpert bank: {len(moe_layers)} MoE layers x {n_exp} experts "
+              f"(block {ebb:,} B, stride {ebs:,})...")
+        for L in _tqdm(moe_layers, desc="Expert bank"):
+            b = f"blk.{L}."
+            # Dequant one projection at a time (peak ~hidden*expert_dim*nexp*4 B
+            # ≈ 4.8 GB), pack all 192 experts' blocks for that projection, free.
+            packed = {}  # proj -> list[192] of bytes
+            for proj, key in (("gate", "ffn_gate_exps.weight"),
+                              ("up",   "ffn_up_exps.weight"),
+                              ("down", "ffn_down_exps.weight")):
+                arr = deq(b + key)              # [n_exp, out, in] float32
+                blocks = [None] * n_exp
+                for e in range(n_exp):
+                    blocks[e] = _float32_to_dense_blocks(arr[e])  # [out,in]→bytes
+                packed[proj] = blocks
+                del arr
+                gc.collect()
+            for e in range(n_exp):
+                block = packed["gate"][e] + packed["up"][e] + packed["down"][e]
+                assert len(block) == ebb, (len(block), ebb)
+                pos = expert_bank_offset + (L * n_exp + e) * ebs
+                f.seek(pos)
+                f.write(block)
+                n_written += 1
+            del packed
+            gc.collect()
+
+        f.seek(0, 2)
+        end = align_up(f.tell())
+        f.truncate(end)
+
+        f.seek(0)
+        f.write(_pack_header(
+            cfg, shared_dir_offset, shared_dir_count,
+            expert_bank_offset, n_blk * n_exp,
+        ))
+
+    fsize = Path(output_path).stat().st_size
+    print(f"\nConversion complete: {output_path}")
+    print(f"  File size:      {fsize / 1e9:.2f} GB ({fsize:,} bytes)")
+    print(f"  Shared entries: {shared_dir_count}")
+    print(f"  Expert blocks:  {n_written} (MoE layers 1..{n_blk-1} x {n_exp})")
+    print(f"  Wall time:      {time.time() - t_start:.1f}s")
+    return str(out)
+
+
 # ─── HC sidecar (Hybrid Connection only) ───────────────────────────────
 
 
@@ -2249,6 +2512,7 @@ if __name__ == "__main__":
         "  python3 fst_converter.py full <model_dir> [output]        # full model\n"
         "  python3 fst_converter.py dspark <model_dir> [main_out] [draft_out]  # DSpark\n"
         "  python3 fst_converter.py draft <model_dir> [output]       # draft only\n"
+        "  python3 fst_converter.py hy3 <gguf> [output]              # Hunyuan-3.0 GGUF\n"
         "  python3 fst_converter.py verify <fst_file>               # verify .fst\n"
     )
 
@@ -2326,6 +2590,14 @@ if __name__ == "__main__":
         path = sys.argv[2] if len(sys.argv) > 2 else "deepseek_v4_full.fst"
         print(f"=== Verifying {path} ===")
         verify_fst(path)
+
+    elif cmd == "hy3":
+        gguf_path = sys.argv[2] if len(sys.argv) > 2 else "hy3-1M-MTP-Q3_K_M.gguf"
+        out = sys.argv[3] if len(sys.argv) > 3 else "hy3.fst"
+        print(f"=== Converting Hunyuan-3.0 (hy_v3) GGUF -> {out} ===")
+        convert_hy3(gguf_path, out, verbose=True)
+        print(f"\n=== Verifying {out} ===")
+        verify_fst(out)
 
     else:
         print(f"Unknown command: {cmd}")

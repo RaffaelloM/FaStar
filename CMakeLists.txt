@@ -19,6 +19,7 @@ endif()
 # /usr/share/cmake/{XRT,AIEBU}). find_package resolves them automatically.
 find_package(XRT REQUIRED)
 find_package(AIEBU REQUIRED)
+find_package(OpenMP REQUIRED)
 
 # ── Header-only libraries fetched at configure time via FetchContent ──────
 # The repo ships ZERO third_party/ vendored folders. cpp-httplib (HTTP server)
@@ -99,4 +100,5 @@ target_link_libraries(ds4_npu_engine PRIVATE
     uuid
     pthread
     dl
+    OpenMP::OpenMP_CXX
 )

@@ -4,7 +4,7 @@
 This script uses the IRON Python API to build each of the 8 MLA kernels
 (qc, kvc, qk, sv, oa, ob, wq_b, k_pe) as a separate `aie.runtime_sequence`
 inside one coherent `aie.device(npu2)`.  All kernels link against a single
-C++ source file: `fst_mla_unified_kernel.cc`.
+C++ source file: `fst_mla_unified_kernels.cc`.
 
 The script then invokes `aiecc` once and extracts per-kernel NPU instruction
 binaries with `aie-translate --aie-sequence-name=<kernel>` so that every
@@ -68,7 +68,7 @@ M_LATENT = 512              # M_FIX * MLA_N_HEADS = 8 * 64
 K_LATENT = 512              # MLA_HEAD_DIM (kv_latent shared across heads)
 D_LATENT = 512              # SV output dim = head_dim (same as kv_latent)
 
-SRC = str(PROJ_ROOT / "fst_mla_unified_kernel.cc")
+SRC = str(PROJ_ROOT / "fst_mla_unified_kernels.cc")
 AIE_KERNEL_DIR = Path(config.cxx_header_path()) / "aie_kernels"
 INC = [str(AIE_KERNEL_DIR.parent), str(PROJ_ROOT)]
 
@@ -507,7 +507,7 @@ def compile_external_objects():
     """Compile the shared C++ tile kernels once; aiecc links one object."""
     from aie.utils.compile import compile_cxx_core_function
 
-    out_o = PROJ_ROOT / "fst_mla_unified_kernel.o"
+    out_o = PROJ_ROOT / "fst_mla_unified_kernels.o"
     print(f"Compiling {out_o.name}...", flush=True)
     compile_cxx_core_function(
         source_path=SRC,
@@ -524,7 +524,7 @@ def unify_link_with(mlir_text: str) -> str:
     """Point every func.func private link_with at the single shared object."""
     return re.sub(
         r'attributes \{link_with = "[^"]+\.o"\}',
-        'attributes {link_with = "fst_mla_unified_kernel.o"}',
+        'attributes {link_with = "fst_mla_unified_kernels.o"}',
         mlir_text,
     )
 

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 #include <stdexcept>
 
 /* ================================================================== */
@@ -51,11 +52,20 @@ ExpertPager::ExpertPager(const std::string &path, size_t cap)
 
     parse_header();
 
-    /* Launch background worker */
+    /* Predictive-prefetch lead (layers ahead, Markov same-eids).  0 disables
+     * predictive prefetch (reactive miss-path only = the old baseline). */
+    if (const char *e = std::getenv("FST_PREFETCH_AHEAD"))
+        prefetch_ahead_ = std::atoi(e);
+    if (prefetch_ahead_ < 0) prefetch_ahead_ = 0;
+
+    /* Launch background worker.  (A multi-worker pool was tried to parallelize
+     * the 8-expert/layer SSD load, but the SSD is ~1 GB/s bandwidth-bound, not
+     * queue-depth-bound, so parallel reads did not aggregate — and the extra
+     * workers only contended on cache_mtx_.  Reverted to the single worker.) */
     worker_ = std::thread(&ExpertPager::worker_loop, this);
 
-    fprintf(stderr, "ExpertPager: %zu tensors, cache=%zu MB\n",
-            tensor_off_.size(), capacity_ / (1024 * 1024));
+    fprintf(stderr, "ExpertPager: %zu tensors, cache=%zu MB, prefetch_ahead=%d\n",
+            tensor_off_.size(), capacity_ / (1024 * 1024), prefetch_ahead_);
 }
 
 ExpertPager::~ExpertPager()
@@ -322,23 +332,33 @@ void ExpertPager::prefetch(int layer_id, int expert_id)
         queue_.push_back({layer_id, expert_id});
     }
     stat_prefetch_.fetch_add(1, std::memory_order_relaxed);
-    queue_cv_.notify_one();
+    queue_cv_.notify_all();
 }
 
 /* ── Predictive prefetch ────────────────────────────────────────────── */
 void ExpertPager::predict_and_prefetch(int cur_layer, const int* eids, int n)
 {
-    /* Queue the current layer's own experts (cheap no-op if cached) so
-     * the worker starts any missing loads immediately, then queue the
-     * SAME expert ids for the next layer.  The next layer's experts are
-     * fetched from SSD while the current layer's expert FFN runs on the
-     * NPU, hiding I/O behind compute. */
+    /* Queue the current layer's own experts first, then the SAME expert ids
+     * (Markov: adjacent layers reuse experts for a given token) for the next
+     * `prefetch_ahead_` layers.  The queue is LIFO (worker pops back()), so
+     * pushing cur first and ahead last makes the worker pop the NEAREST ahead
+     * layer first — it reads L+1 during cur's compute, L+2 next, etc., hiding
+     * I/O behind compute (decode compute ~125 ms/layer > SSD read ~80 ms/layer,
+     * so the worker stays ahead once it has a head start).  For AHEAD>1 each
+     * layer is also first-pushed AHEAD layers early by earlier calls, so even
+     * though the within-call pop order is furthest-ahead-first, the cross-call
+     * redundancy means every layer's experts are queued well before they're
+     * needed — provided the RAM cache is large enough to retain them (use
+     * FST_RAM_CACHE_GB, else ahead-experts get evicted before use → thrash). */
     for (int k = 0; k < n; k++)
         prefetch(cur_layer, eids[k]);
-    int next = cur_layer + 1;
-    if (next >= num_layers_) return;
-    for (int k = 0; k < n; k++)
-        prefetch(next, eids[k]);
+    const int AHEAD = prefetch_ahead_;
+    for (int a = 1; a <= AHEAD; a++) {
+        int nl = cur_layer + a;
+        if (nl >= num_layers_) break;
+        for (int k = 0; k < n; k++)
+            prefetch(nl, eids[k]);
+    }
 }
 
 /* ── CPU router for draft-driven prefetch ──────────────────────────── */
@@ -460,6 +480,22 @@ const Expert &ExpertPager::get(int layer_id, int expert_id)
         }
     }
 
+    /* Slow path: not a fast hit — we will stall on SSD.  Time it so the
+     * post-mortem can see whether predictive prefetch actually hid the I/O
+     * (hit_rate is misleading: a miss that later succeeds still counts as a
+     * hit).  t0 is taken AFTER the fast path so cache hits cost zero. */
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
+    auto acc_wait = [&]() {
+        long us = (long)std::chrono::duration_cast<std::chrono::microseconds>(
+                      clock::now() - t0).count();
+        stat_wait_us_.fetch_add(us, std::memory_order_relaxed);
+        stat_wait_count_.fetch_add(1, std::memory_order_relaxed);
+        long mx = stat_max_wait_us_.load(std::memory_order_relaxed);
+        while (us > mx && !stat_max_wait_us_.compare_exchange_weak(
+                    mx, us, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    };
+
     /* Wait if the worker thread is currently loading this expert */
     {
         std::unique_lock<std::mutex> g(cache_mtx_);
@@ -471,6 +507,7 @@ const Expert &ExpertPager::get(int layer_id, int expert_id)
         if (it != map_.end()) {
             lru_.splice(lru_.begin(), lru_, it->second);
             stat_hits_.fetch_add(1, std::memory_order_relaxed);
+            acc_wait();
             return it->second->second;
         }
     }
@@ -490,7 +527,7 @@ const Expert &ExpertPager::get(int layer_id, int expert_id)
         if (!already)
             queue_.push_back({layer_id, expert_id});
     }
-    queue_cv_.notify_one();
+    queue_cv_.notify_all();
 
     std::unique_lock<std::mutex> g(cache_mtx_);
     for (;;) {
@@ -498,6 +535,7 @@ const Expert &ExpertPager::get(int layer_id, int expert_id)
         if (it != map_.end()) {
             lru_.splice(lru_.begin(), lru_, it->second);
             stat_hits_.fetch_add(1, std::memory_order_relaxed);
+            acc_wait();
             return it->second->second;
         }
         /* Spuriously wake and re-check until the worker has inserted it. */
@@ -550,10 +588,11 @@ void ExpertPager::worker_loop()
 
         CacheKey key{req.layer, req.expert};
 
-        /* Skip if already cached */
+        /* Skip if already cached OR another worker is already loading it (pool
+         * dedup — avoids two workers reading the same expert from SSD). */
         {
             std::lock_guard<std::mutex> g(cache_mtx_);
-            if (map_.count(key)) continue;
+            if (map_.count(key) || loading_.count(key)) continue;
             loading_.insert(key);
         }
 
