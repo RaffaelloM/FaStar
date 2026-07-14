@@ -240,6 +240,38 @@ static void dequant_mxfp4_dense(float* out, const uint8_t* packed,
         }
     }
 }
+/* ── Fused MXFP4 matvec (M=1) for ARCH_QWEN35 dense projections/FFN ──────────
+ * out[n] = Σ_k W[n,k]·h[k], W packed MXFP4 (17-byte blocks of 32 along k).
+ * Dequanting the whole [N,K] weight to fp32 first would cost 69 GB/token for the
+ * FFN alone (3×17408×5120×4) and need a 356 MB scratch — infeasible in 35 GB RAM.
+ * Fusing the block dequant into the dot does ONE pass (the MACs themselves),
+ * no scratch, and is 2× the work of dequant+separate-GEMM.  OpenMP over N.
+ * Used for ALL q35 projections (M=1 decode/prefill: the SSM scan is recurrent so
+ * prefill is a token-by-token M=1 loop too). */
+static void mxfp4_matvec_f32(float* out, const float* h, const uint8_t* packed,
+                             int N, int K) {
+    const int groups = K / 32;
+    #pragma omp parallel for schedule(static)
+    for (int n = 0; n < N; n++) {
+        const uint8_t* row = packed + (size_t)n * groups * 17;
+        const float* hn = h;   /* shared input row (M=1) */
+        float acc = 0.0f;
+        for (int g = 0; g < groups; g++) {
+            const uint8_t* blk = row + (size_t)g * 17;
+            uint8_t sc = blk[0];
+            if (sc == 0) continue;                       /* dead block ⇒ 0 contrib */
+            float scale = std::ldexp(1.0f, (int)sc - 127);
+            const uint8_t* nb = blk + 1;
+            const float* hb = hn + g * 32;
+            for (int i = 0; i < 32; i++) {
+                uint8_t byte = nb[i >> 1];
+                uint8_t nib = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                acc += FP4_TABLE[nib] * scale * hb[i];
+            }
+        }
+        out[n] = acc;
+    }
+}
 
 /* HY3 sigmoid+bias router (host; the 192-wide GEMM is tiny vs the expert FFN).
  * router_w is [hd, n_experts]=[K,N] (transposed at load, matches router_gemm).
@@ -1521,6 +1553,32 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
                         config_.top_k, config_.first_k_dense_replace,
                         config_.expert_weights_scale, config_.rope_scaling_factor);
             }
+            /* Detect Qwen3.5-Next (QWEN35): GQA 24 Q / 4 KV @ head_dim 256 — the
+             * hybrid SSM+GQA+MTP dense model.  qh=24, kh=4, hd2=256.  num_experts=0
+             * (dense).  SSM/rope/eps detail is read from the TID_Q35_CFG blob in
+             * load_qwen35_shared_weights (the dir isn't loaded yet here); r1/r2 carry
+             * the hybrid cadence + rope sections:
+             *   r1 low16 = full_attention_interval (4), r1 high16 = nextn_predict_layers
+             *   r2 low16×4 = rope.dimension_sections */
+            else if (eh->qh == 24 && eh->kh == 4 && eh->hd2 == 256) {
+                config_.arch = ARCH_QWEN35;
+                config_.num_q_heads  = (int)eh->qh;        /* 24 */
+                config_.num_kv_heads = (int)eh->kh;        /* 4  */
+                config_.head_dim    = (int)eh->hd2;        /* 256 */
+                config_.expert_inter_dim = (int)eh->id;    /* 17408 (FFN inter) */
+                config_.rope_dim    = config_.head_dim;    /* rotate full head_dim */
+                config_.full_attn_interval = (int)(eh->r1 & 0xFFFFu) ?: 4;
+                config_.nextn_predict_layers = (int)((eh->r1 >> 16) & 0xFFFFu);
+                for (int s = 0; s < 4; ++s)
+                    config_.rope_sections[s] = (int)((eh->r2 >> (16 * s)) & 0xFFFFu);
+                config_.yarn_orig_ctx = 262144;
+                fprintf(stderr, "[arch] QWEN35 (Qwen3.5-Next): %d layers, hybrid GQA %d/%d @ %d, "
+                        "dense, FFN inter %d, full-attn interval %d, rope_sections=[%d,%d,%d,%d]\n",
+                        config_.n_layers, config_.num_q_heads, config_.num_kv_heads,
+                        config_.head_dim, config_.expert_inter_dim, config_.full_attn_interval,
+                        config_.rope_sections[0], config_.rope_sections[1],
+                        config_.rope_sections[2], config_.rope_sections[3]);
+            }
             ::close(efd);
         }
     }
@@ -1542,6 +1600,13 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     // (gate/up/silu/mul/down, 8 cores 1 expert/core) = 6 dispatches/layer vs 48.
     // Reuses the proven expert_gemm_mc_op (DS4 MC, cos 0.9988) at HY3 shapes.
     hy3_fused_ffn_ = (config_.arch == ARCH_HY3) && (std::getenv("FST_HY3_FUSED_FFN") != nullptr);
+    // HY3 ping-pong double-buffer (FST_HY3_PINGPONG): overlap SSD expert reads
+    // with NPU FFN compute.  At each decode layer the engine barrier-waits until
+    // this layer's experts are resident (so the FFN's get()s never stall on
+    // SSD), then issues the next layer's prefetch (Markov: same eids) so the
+    // background SSD worker reads L+1 while the NPU computes L.  Decode-only
+    // (M==1); prefill keeps the reactive path.  Default off = current 0.14 path.
+    pingpong_ = (config_.arch == ARCH_HY3) && (std::getenv("FST_HY3_PINGPONG") != nullptr);
     if (config_.arch == ARCH_HY3) {
         if (hy3_fused_ffn_) {
             // 8-expert batched MC kernels (gate/up share hy3_gemm_vec_mc_8exp;
@@ -1602,6 +1667,42 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
             // which measured 4.5× slower than 8 pipelined per-expert dequants).
             // Kept registered for A/B comparison.
             kernel_cache_->register_kernel("hy3_dequant_8exp", "fst_hy3_dequant_8exp_insts.bin", "fst_hy3_dequant_8exp.xclbin");
+    } else if (config_.arch == ARCH_QWEN35) {
+        /* QWEN35 GDN scan: 3-PASS bit-correct path (fst_gdn_passA/delta/passB),
+         * 3 xclbins / 3 hw_contexts / 3 xrt::run per SSM layer (144 dispatches/
+         * token).  The fused single-dispatch kernel (fst_gdn_fused.xclbin) has a
+         * first-v-head startup fill-race (4 fifos / 2 concurrent MM2S fills on
+         * this IRON build) and is NOT bit-correct — reverted out; see
+         * docs/QWOPUS_FUSED_GDN_POSTMORTEM.md.  State S[128,128] per v-head
+         * streamed from DDR (read twice — passA then passB).  No dequant xclbin
+         * — qwen35 is dense and dequants MXFP4 on the host. */
+        kernel_cache_->register_kernel("q35_gdn_passA", "fst_gdn_passA_insts.bin", "fst_gdn_passA.xclbin");
+        kernel_cache_->register_kernel("q35_gdn_delta", "fst_gdn_delta_insts.bin", "fst_gdn_delta.xclbin");
+        kernel_cache_->register_kernel("q35_gdn_passB", "fst_gdn_passB_insts.bin", "fst_gdn_passB.xclbin");
+        /* FUSED single-dispatch GDN (1 xrt::run/SSM-layer = 48 dispatches/token).
+         * Gate: FST_Q35_GDN_FUSED=1 selects it in gdn_scan_vheads.  Registered
+         * unconditionally (1 extra hw_context, total 7 < 9).  The depth=2/2 late-par
+         * xclbin has a vh0 startup race (47/48 correct) — under fix. */
+        kernel_cache_->register_kernel("q35_gdn_fused", "fst_gdn_fused_insts.bin", "fst_gdn_fused.xclbin");
+        /* M=1 NPU FFN is DEAD (not registered): emulated aie::mmul<8,8,8> bfp16 =
+         * 33ms/matvec > 10.7ms OpenMP host (3.26x slower, measured in the real
+         * engine); native <4,8,8>/<8,8,8> bf16 has the structural -4 register
+         * underflow that an M=1 matvec argmax cannot tolerate. The kernel artifacts
+         * (kernels/fst_qwopus_ffn*) + probe are KEPT as infrastructure: the native
+         * fast 1.89ms GEMM shape is CORRECT for M>=4 (cos 0.9988 dilution tolerates
+         * the -4), so this is the M=K speculative-decoding VERIFY accelerator, NOT
+         * the M=1 path. Revivable behind a future FST_Q35_FFN_NPU_MK gate. */
+        /* M=8 SD-verify FFN (fst_qwopus_ffn_m8): 16-tile N-split, 8 h-vectors fill
+         * the 8 A-rows of native <8,8,4> FREE; measured 48.5ms/8tok vs host 85.6ms
+         * (1.76x), 8/8 argmax MATCH both shapes, compute-bound (DMA floor 3.79ms).
+         * Serves gate/up [17408,5120] and down [5120,17408] from ONE xclbin (host
+         * packs N_TILE_USED=1088 up / 320 down). Registered ONLY behind
+         * FST_Q35_FFN_NPU (1 extra hw_context: Q35 baseline 7 -> 8 < 9). The gate
+         * also drives the engine-level A/B harness (capture 8 pre-FFN h's from a
+         * host run, run full 64-layer M=8 NPU FFN, compare to host 8x). Shipped
+         * 0.20 tok/s M=1 host path is untouched when the flag is unset. */
+        if (std::getenv("FST_Q35_FFN_NPU"))
+            kernel_cache_->register_kernel("q35_ffn_m8", "fst_qwopus_ffn_m8_insts.bin", "fst_qwopus_ffn_m8.xclbin");
     } else
         kernel_cache_->register_kernel("dequant",    "fst_dequant_v4_insts.bin",         "fst_dequant_v4.xclbin");
     // Context 5: ew_unified -- 7 kernels sharing ONE xclbin / ONE hw_context:
@@ -1739,7 +1840,7 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
     }
     } /* end !randmat */
 
-    {float mx=-1e30f,mn=1e30f; double s=0; for(size_t i=0;i<host_embedding_table_.size();i++){float v=bf16f(host_embedding_table_[i]); if(std::isnan(v)){continue;} if(v>mx)mx=v; if(v<mn)mn=v; s+=(double)v;} fprintf(stderr,"[emb] after preload: %zu elems, mn=%.4f mx=%.4f sum=%.2f [0:4]=",host_embedding_table_.size(),mn,mx,s); for(int i=0;i<4;i++)fprintf(stderr,"%.4f ",bf16f(host_embedding_table_[i])); fprintf(stderr,"\n"); fflush(stderr);}
+    if (!host_embedding_table_.empty()) {float mx=-1e30f,mn=1e30f; double s=0; for(size_t i=0;i<host_embedding_table_.size();i++){float v=bf16f(host_embedding_table_[i]); if(std::isnan(v)){continue;} if(v>mx)mx=v; if(v<mn)mn=v; s+=(double)v;} fprintf(stderr,"[emb] after preload: %zu elems, mn=%.4f mx=%.4f sum=%.2f [0:4]=",host_embedding_table_.size(),mn,mx,s); for(int i=0;i<4;i++)fprintf(stderr,"%.4f ",bf16f(host_embedding_table_[i])); fprintf(stderr,"\n"); fflush(stderr);} else { fprintf(stderr,"[emb] QWEN35 raw-MXFP4 embed (%zu bytes), no bf16 table preload\n", q35_embed_raw_.size()); fflush(stderr); }
 
     // Pre-allocate scratch BOs for zero-copy dispatch.
     // Dummy/workspace BOs MUST be >= 1 MB: the IRON ext::kernel DMA engines
@@ -1967,6 +2068,53 @@ FSTEngine::FSTEngine(const std::string& fst_path, size_t cache_mb) {
         fflush(stderr);
         std::exit(0);
     }
+
+    /* FST_Q35_NEXTN_PROBE: host-only smoke test of the Q35 NextN MTP head (L64).
+     * Runs forward_nextn_draft_q35 (n_max=3, p_min=0) on a synthetic trunk
+     * post-output_norm hidden + a token id; re-runs step 0 to capture the
+     * post-norm hidden range + top-5 logits.  Verifies the L64 eh_proj MXFP4
+     * matvec (HF [out,in] layout), MTP GQA+FFN (own KV), shared_head_norm and
+     * lm_head run without NaN/crash and produce finite draft tokens.  Requires
+     * the converter to have emitted L64 weights (qwopus_bf16_mtp.fst). */
+    if (config_.arch == ARCH_QWEN35 && std::getenv("FST_Q35_NEXTN_PROBE")) {
+        const int hd = config_.hidden_dim;
+        const int V  = config_.vocab_size;
+        auto& w = q35_shared_[config_.n_layers - 1];
+        fprintf(stderr, "[q35-nextn-probe] L64 kind=%d eh_proj=%zuB enorm=%zu hnorm=%zu shn=%zu "
+                "q=%zu k=%zu v=%zu o=%zu gate=%zu up=%zu down=%zu attn_norm=%zu ffn_norm=%zu\n",
+                w.kind, w.nextn_eh_proj.size(), w.nextn_enorm.size(), w.nextn_hnorm.size(),
+                w.nextn_shared_head_norm.size(), w.q_proj.size(), w.k_proj.size(),
+                w.v_proj.size(), w.o_proj.size(), w.ffn_gate.size(), w.ffn_up.size(),
+                w.ffn_down.size(), w.attn_norm.size(), w.ffn_norm.size());
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> h_prev(hd);
+        for (int d = 0; d < hd; d++) h_prev[d] = f2bf(0.01f * (float)(d % 64) - 0.32f);
+        const int last_id = 1;
+        double t0 = now();
+        DraftResult dr = forward_nextn_draft_q35(h_prev.data(), last_id, 3, 0.0f);
+        double dt = now() - t0;
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> hpost(hd);
+        std::vector<float> logits(V);
+        q35_kv_cache_[config_.n_layers - 1].n = 0;
+        int d0 = forward_nextn_step_q35(last_id, h_prev.data(), 0, hpost.data(), logits.data());
+        int nf = 0; float mn = 1e30f, mx = -1e30f;
+        for (int d = 0; d < hd; d++) { float v = bf16f(hpost[d]); if (std::isnan(v)) { nf++; continue; } if (v < mn) mn = v; if (v > mx) mx = v; }
+        int lf = 0; for (int v = 0; v < V; v++) if (std::isnan(logits[v])) lf++;
+        std::vector<std::pair<float,int>> tl(V);
+        for (int v = 0; v < V; v++) tl[v] = {logits[v], v};
+        std::partial_sort(tl.begin(), tl.begin() + 5, tl.end(),
+                          [](const std::pair<float,int>& a, const std::pair<float,int>& b){ return a.first > b.first; });
+        fprintf(stderr, "[q35-nextn-probe] draft tokens:");
+        for (int t : dr.tokens) fprintf(stderr, " %d", t);
+        fprintf(stderr, "  conf:");
+        for (float c : dr.confidence) fprintf(stderr, " %.3f", c);
+        fprintf(stderr, "\n[q35-nextn-probe] step0 draft=%d h_post nan=%d mn=%.4f mx=%.4f "
+                "logits_nan=%d V=%d  top5:", d0, nf, mn, mx, lf, V);
+        for (int i = 0; i < 5; i++) fprintf(stderr, " (%d:%.3f)", tl[i].second, tl[i].first);
+        fprintf(stderr, "  %.3fs\n", dt);
+        if (nf || lf || dr.tokens.empty()) std::exit(1);
+        fflush(stderr);
+        std::exit(0);
+    }
 }
 
 FSTEngine::~FSTEngine() {
@@ -2006,6 +2154,25 @@ void FSTEngine::load_shared_weights(const std::string& fst_path) {
         config_.yarn_orig_ctx = 262144;
         ::close(fd);
         load_hy3_shared_weights(fst_path);
+        return;
+    }
+    /* QWEN35 (Qwen3.5-Next, hybrid SSM+GQA+MTP dense) — TID-based loader, same
+     * reason as HY3 (the DS4 shape-keyed map does not apply).  Re-derive arch
+     * from the header, then hand off to load_qwen35_shared_weights. */
+    if (h->qh == 24 && h->kh == 4 && h->hd2 == 256) {
+        config_.arch = ARCH_QWEN35;
+        config_.num_q_heads  = (int)h->qh;       /* 24 */
+        config_.num_kv_heads = (int)h->kh;       /* 4  */
+        config_.head_dim    = (int)h->hd2;       /* 256 */
+        config_.expert_inter_dim = (int)h->id;  /* 17408 (FFN inter) */
+        config_.rope_dim    = config_.head_dim;
+        config_.full_attn_interval = (int)(h->r1 & 0xFFFFu) ?: 4;
+        config_.nextn_predict_layers = (int)((h->r1 >> 16) & 0xFFFFu);
+        for (int s = 0; s < 4; ++s)
+            config_.rope_sections[s] = (int)((h->r2 >> (16 * s)) & 0xFFFFu);
+        config_.yarn_orig_ctx = 262144;
+        ::close(fd);
+        load_qwen35_shared_weights(fst_path);
         return;
     }
 
@@ -2440,6 +2607,184 @@ void FSTEngine::load_hy3_shared_weights(const std::string& fst_path) {
             config_.n_layers, config_.dense_inter_dim,
             host_embedding_table_.size(), host_lm_head_.size(),
             model_.final_norm_bytes / sizeof(bf16_t));
+    fflush(stderr);
+    ::close(fd);
+}
+
+void FSTEngine::load_qwen35_shared_weights(const std::string& fst_path) {
+    /* QWEN35 shared-bank TIDs (must match scripts/fst_converter.py:192-214). */
+    constexpr uint32_t T_EMBED=0, T_OUTPUT_NORM=1, T_LM_HEAD=2,
+        T_INPUT_NORM=3, T_POST_ATTN_NORM=4, T_Q_PROJ=5, T_K_PROJ=6,
+        T_V_PROJ=7, T_O_PROJ=8,
+        T_Q35_Q_NORM=60, T_Q35_K_NORM=61,
+        T_Q35_FFN_GATE=62, T_Q35_FFN_UP=63, T_Q35_FFN_DOWN=64,
+        T_Q35_SSM_QKV=65, T_Q35_SSM_GATE=66, T_Q35_SSM_CONV1D=67,
+        T_Q35_SSM_A=68, T_Q35_SSM_ALPHA=69, T_Q35_SSM_BETA=70,
+        T_Q35_SSM_DT_BIAS=71, T_Q35_SSM_NORM=72, T_Q35_SSM_OUT=73,
+        T_Q35_NEXTN_EH_PROJ=74, T_Q35_NEXTN_ENORM=75, T_Q35_NEXTN_HNORM=76,
+        T_Q35_NEXTN_HEAD_NORM=77, T_Q35_LAYER_TYPES=78, T_Q35_CFG=79;
+    constexpr int QTYPE_BF16=2, QTYPE_F32=3, QTYPE_MXFP4=4;
+    constexpr int GLOBAL = 0xFFFF;
+
+    int fd = ::open(fst_path.c_str(), O_RDONLY);
+    if (fd < 0) { ::perror("open fst"); throw std::runtime_error("Q35 open fst"); }
+    auto hb = pread(fd, 128, 0);
+    auto* h = (const FSTH*)hb.data();
+    const size_t ne = (size_t)h->sdc;
+    auto db = pread(fd, ne * 64, (off_t)h->sdo);
+
+    struct Ent { std::vector<uint8_t> raw; uint64_t s0=0, s1=0; int qt=0; bool found=false; };
+    auto get = [&](uint32_t tid, int lid) -> Ent {
+        for (size_t i = 0; i < ne; i++) {
+            auto* e = (const FSTE*)(db.data() + i * 64);
+            if (e->tid != tid || (int)e->lid != lid) continue;
+            return { pread(fd, (size_t)e->sz, (off_t)e->off), e->s0, e->s1, (int)e->qt, true };
+        }
+        return {};
+    };
+    auto raw = [&](const Ent& en, std::vector<uint8_t>& v) {
+        if (!en.found) return false; v = en.raw; return true;
+    };
+    auto to_bf16 = [&](const Ent& en, std::vector<bf16_t, AlignedAllocator<bf16_t>>& v) {
+        if (!en.found || en.qt != QTYPE_BF16) return false;
+        v.resize(en.raw.size() / sizeof(bf16_t));
+        std::memcpy(v.data(), en.raw.data(), en.raw.size()); return true;
+    };
+    auto to_f32 = [&](const Ent& en, std::vector<float>& v) {
+        if (!en.found || en.qt != QTYPE_F32) return false;
+        v.resize(en.raw.size() / sizeof(float));
+        std::memcpy(v.data(), en.raw.data(), en.raw.size()); return true;
+    };
+
+    /* ── Parse the full config blob + per-layer kinds (authoritative). ── */
+    {
+        auto cfg = get(T_Q35_CFG, GLOBAL);
+        auto lt  = get(T_Q35_LAYER_TYPES, GLOBAL);
+        if (!cfg.found || cfg.raw.size() < 23 * sizeof(float))
+            throw std::runtime_error("Q35: missing/short TID_Q35_CFG");
+        const float* C = reinterpret_cast<const float*>(cfg.raw.data());
+        config_.hidden_dim        = (int)C[0];
+        config_.n_layers          = (int)C[1];
+        config_.num_q_heads       = (int)C[2];
+        config_.num_kv_heads      = (int)C[3];
+        config_.head_dim          = (int)C[4];
+        config_.expert_inter_dim  = (int)C[5];
+        config_.vocab_size        = (int)C[6];
+        config_.rms_eps           = C[7];
+        rope_freq_base_           = C[8];
+        config_.full_attn_interval= (int)C[9];
+        config_.nextn_predict_layers=(int)C[10];
+        config_.ssm_state_dim     = (int)C[11];
+        config_.ssm_n_kheads       = (int)C[12];          /* group_count = 16 */
+        config_.ssm_conv_k         = (int)C[13];
+        config_.ssm_dt_rank        = (int)C[14];
+        config_.ssm_inner          = (int)C[15];          /* 6144 */
+        config_.ssm_n_vheads       = config_.ssm_inner / config_.ssm_state_dim;  /* 48 */
+        config_.ssm_qk_repeat      = config_.ssm_n_vheads / config_.ssm_n_kheads; /* 3 */
+        for (int s = 0; s < 4; ++s) config_.rope_sections[s] = (int)C[16 + s];
+        config_.rope_dim           = config_.head_dim;
+        config_.max_seq            = 8192;                /* bound GQA KV alloc */
+        config_.layer_types.assign(config_.n_layers, 0);
+        if (lt.found) {
+            const float* L = reinterpret_cast<const float*>(lt.raw.data());
+            for (int l = 0; l < config_.n_layers && l < (int)(lt.raw.size()/sizeof(float)); l++)
+                config_.layer_types[l] = (int)L[l];
+        }
+    }
+
+    const int hidden = config_.hidden_dim;
+    const int nL     = config_.n_layers;
+    const int last   = nL - 1;
+
+    q35_shared_.assign(nL, Q35LayerWeights{});
+    q35_ssm_state_.assign(nL, Q35SSMState{});
+    q35_kv_cache_.assign(nL, Hy3KVCache{});
+    const int kv_row = config_.num_kv_heads * config_.head_dim;   /* 4*256 = 1024 */
+    for (auto& kv : q35_kv_cache_) {
+        kv.k.assign((size_t)config_.max_seq * kv_row, f2bf(0.0f));
+        kv.v.assign((size_t)config_.max_seq * kv_row, f2bf(0.0f));
+        kv.n = 0;
+    }
+
+    for (int l = 0; l < nL; l++) {
+        auto& w = q35_shared_[l];
+        w.kind = (l < (int)config_.layer_types.size()) ? config_.layer_types[l] : 0;
+        to_bf16(get(T_INPUT_NORM,    l), w.attn_norm);     /* [hidden] BF16 */
+        to_bf16(get(T_POST_ATTN_NORM,l), w.ffn_norm);      /* [hidden] BF16 */
+        /* FFN (every layer): raw MXFP4. */
+        raw(get(T_Q35_FFN_GATE, l), w.ffn_gate);
+        raw(get(T_Q35_FFN_UP,   l), w.ffn_up);
+        raw(get(T_Q35_FFN_DOWN, l), w.ffn_down);
+
+        if (w.kind == 0) {                                 /* SSM (Gated Delta Net) */
+            raw(get(T_Q35_SSM_QKV,    l), w.ssm_qkv);
+            raw(get(T_Q35_SSM_GATE,   l), w.ssm_gate);
+            to_f32(get(T_Q35_SSM_CONV1D, l), w.ssm_conv1d);   /* [4,10240] F32 */
+            to_f32(get(T_Q35_SSM_A,      l), w.ssm_a);        /* [48] F32 */
+            raw(get(T_Q35_SSM_ALPHA,    l), w.ssm_alpha);
+            raw(get(T_Q35_SSM_BETA,     l), w.ssm_beta);
+            to_f32(get(T_Q35_SSM_DT_BIAS,l), w.ssm_dt_bias);  /* [48] F32 */
+            to_f32(get(T_Q35_SSM_NORM,   l), w.ssm_norm);     /* [128] F32 */
+            raw(get(T_Q35_SSM_OUT,       l), w.ssm_out);
+        } else {                                           /* full-attn (1) or MTP (2) */
+            raw(get(T_Q_PROJ,      l), w.q_proj);
+            raw(get(T_K_PROJ,      l), w.k_proj);
+            raw(get(T_V_PROJ,      l), w.v_proj);
+            raw(get(T_O_PROJ,      l), w.o_proj);
+            to_f32(get(T_Q35_Q_NORM, l), w.q_norm);          /* [256] F32 */
+            to_f32(get(T_Q35_K_NORM, l), w.k_norm);          /* [256] F32 */
+            if (w.kind == 2) {                              /* MTP extras */
+                raw(get(T_Q35_NEXTN_EH_PROJ,    l), w.nextn_eh_proj);
+                to_f32(get(T_Q35_NEXTN_ENORM,   l), w.nextn_enorm);
+                to_f32(get(T_Q35_NEXTN_HNORM,   l), w.nextn_hnorm);
+                to_f32(get(T_Q35_NEXTN_HEAD_NORM,l), w.nextn_shared_head_norm);
+            }
+        }
+        if ((l + 1) % 8 == 0 || l == last) {
+            fprintf(stderr, "[q35-load] L%-3d kind=%d an=%zu fg=%zu qkv=%zu "
+                    "conv1d=%zu a=%zu norm=%zu q=%zu\n", l, w.kind,
+                    w.attn_norm.size(), w.ffn_gate.size(), w.ssm_qkv.size(),
+                    w.ssm_conv1d.size(), w.ssm_a.size(), w.ssm_norm.size(),
+                    w.q_proj.size());
+            fflush(stderr);
+        }
+    }
+
+    /* ── Globals: embed (raw MXFP4), lm_head (raw MXFP4 → fp32 once, resident),
+     * output_norm (F32).  lm_head is dequanted ONCE here (~5 GB) so the per-token
+     * argmax matvec reuses the resident fp32 copy.  embed stays raw (row-dequant
+     * per token lookup is cheap; the full fp32 embed would be ~5 GB more). ── */
+    {
+        auto e = get(T_EMBED, GLOBAL);
+        if (e.found && e.qt == QTYPE_MXFP4) { q35_embed_raw_ = std::move(e.raw); }
+    }
+    {
+        auto lm = get(T_LM_HEAD, GLOBAL);
+        if (lm.found && lm.qt == QTYPE_MXFP4) {
+            /* dequant [vocab, hidden] → fp32 resident. */
+            const int V = config_.vocab_size, H = config_.hidden_dim;
+            q35_lm_head_.resize((size_t)V * H);
+            dequant_mxfp4_dense(q35_lm_head_.data(), lm.raw.data(), V, H);
+            fprintf(stderr, "[q35-load] lm_head dequanted: %d x %d fp32 (%.2f GB)\n",
+                    V, H, (double)((size_t)V * H * 4) / 1e9); fflush(stderr);
+        }
+    }
+    {
+        auto fn = get(T_OUTPUT_NORM, GLOBAL);
+        if (fn.found && fn.qt == QTYPE_F32) {
+            q35_final_norm_.resize(fn.raw.size() / sizeof(float));
+            std::memcpy(q35_final_norm_.data(), fn.raw.data(), fn.raw.size());
+        }
+    }
+    fprintf(stderr, "[q35-load] done: %d layers (%d SSM + %d GQA + %d MTP), hidden=%d "
+            "inter=%d, vocab=%d, n_v=%d n_k=%d state=%d conv=%d, embed_raw=%zu lm_head=%zu\n",
+            nL,
+            (int)std::count(config_.layer_types.begin(), config_.layer_types.end(), 0),
+            (int)std::count(config_.layer_types.begin(), config_.layer_types.end(), 1),
+            (int)std::count(config_.layer_types.begin(), config_.layer_types.end(), 2),
+            hidden, config_.expert_inter_dim, config_.vocab_size,
+            config_.ssm_n_vheads, config_.ssm_n_kheads, config_.ssm_state_dim,
+            config_.ssm_conv_k, q35_embed_raw_.size(), q35_lm_head_.size());
     fflush(stderr);
     ::close(fd);
 }
@@ -3643,6 +3988,19 @@ void FSTEngine::prefill_tiled(bf16_t* hidden, int M, const int* input_ids,
  * multi-turn chat reuse the KV cache across turns without re-prefilling. */
 void FSTEngine::reset_session() {
     reset_compressor_state();
+    /* ARCH_QWEN35: zero the persistent SSM matrix state S + conv1d buffers and
+     * reset the GQA KV row counts for a fresh chat. */
+    if (config_.arch == ARCH_QWEN35) {
+        for (int l = 0; l < config_.n_layers; l++) {
+            auto& st = q35_ssm_state_[l];
+            std::fill(st.S.begin(), st.S.end(), 0.0f);
+            std::fill(st.conv.begin(), st.conv.end(), 0.0f);
+            q35_kv_cache_[l].n = 0;
+        }
+        seq_pos_ = 0;
+        is_prefill_ = true;
+        return;
+    }
     /* Zero the pre-sized KV buffers (host vector + device BO) so no stale rows
      * from a prior session leak into the next.  Attention only reads ws<S, so
      * this is defensive, but cheap (max_seq*512 bf16/layer). */
@@ -4454,6 +4812,890 @@ void FSTEngine::process_expert_ffn_hy3_fused(int lid, const bf16_t* h, float* ac
  *            + 1 always-on shared expert (BF16).  ffn_out added to h (residual).
  * The NPU expert path (new 1536-inter kernels) is deferred; the dense + shared
  * BF16 paths move to NPU expert_gemm_vec in a later sub-phase. */
+/* ───────────────────────── ARCH_QWEN35 layer dispatch ─────────────────────
+ * process_ssm      — Gated Delta Net block (kind 0, 48 layers).  Host computes
+ *                    the surrounding block (rmsnorm, qkv/gate/alpha/beta proj,
+ *                    causal conv1d, g_logit/beta, l2norm, repeat_interleave,
+ *                    group norm, out proj); the GDN RECURRENCE runs on the NPU
+ *                    via the bit-correct fst_gdn_{passA,delta,passB} kernels
+ *                    (run_registered_blob, one xrt::run per v-head per stage).
+ *                    ZERO CPU fallback for the scan itself.
+ * process_gqa_q35   — full GQA block (kind 1, 16 layers) + MTP (kind 2).
+ * process_ffn_q35   — dense SwiGLU FFN (every layer).
+ * All paths are M=1 (decode-style).  Prefill loops tokens through the same M=1
+ * path (the SSM scan is recurrent; GQA causal attention over a growing KV is
+ * identical to decode at each position). */
+
+/* q35 RMSNorm: bf16 in/out → fp32 internally (weight bf16, eps=config_.rms_eps). */
+static void q35_rmsnorm(float* out, const bf16_t* h, const bf16_t* w, int hd, float eps) {
+    float ss = 0.0f;
+    for (int d = 0; d < hd; d++) { float x = bf16f(h[d]); ss += x * x; }
+    float rcp = 1.0f / std::sqrt(ss / (float)hd + eps);
+    for (int d = 0; d < hd; d++) out[d] = bf16f(h[d]) * rcp * bf16f(w[d]);
+}
+/* Same but with an F32 weight (the Q35 nextn norms nextn_enorm/hnorm/
+ * shared_head_norm are stored F32, and already hold the Gemma 1+delta scale). */
+static void q35_rmsnorm_fw(float* out, const bf16_t* h, const float* w, int hd, float eps) {
+    float ss = 0.0f;
+    for (int d = 0; d < hd; d++) { float x = bf16f(h[d]); ss += x * x; }
+    float rcp = 1.0f / std::sqrt(ss / (float)hd + eps);
+    for (int d = 0; d < hd; d++) out[d] = bf16f(h[d]) * rcp * w[d];
+}
+
+void FSTEngine::process_ssm(int lid, bf16_t* h, int /*M*/) {
+    auto& w = q35_shared_[lid];
+    const int hd   = config_.hidden_dim;          /* 5120 */
+    const int HV   = config_.ssm_state_dim;       /* 128 */
+    const int nK   = config_.ssm_n_kheads;        /* 16  */
+    const int nV   = config_.ssm_n_vheads;        /* 48  */
+    const int rep  = config_.ssm_qk_repeat;       /* 3   */
+    const int Kdim = nK * HV;                      /* 2048  (key_dim)  */
+    const int Vdim = nV * HV;                      /* 6144  (value_dim) */
+    const int Cdim = 2 * Kdim + Vdim;              /* 10240 (conv_dim)  */
+    const int ck   = config_.ssm_conv_k;           /* 4   */
+    const float eps = config_.rms_eps;             /* 1e-6 */
+    const float SCALE = 1.0f / std::sqrt((float)HV);  /* 1/√128 */
+
+    /* FST_SSM_DUMP: capture every SSM-block intermediate for layer 0.  Weights +
+     * the full per-position intermediate chain are dumped so the Python reference
+     * (scripts/qwopus_ssm_block_ref.py) can replay HF qwen3_next recurrently over
+     * the engine's residual stream and find the first diverging POSITION (pos 0
+     * has zero S/conv state, so a state-carry bug is only visible at pos>0).
+     *   dumping  : layer 0, pos 0 only — write the dequanted weights + h_in once.
+     *   dump_seq : layer 0, EVERY position — tag the recurrent chain with seq_pos_. */
+    const char* dump_dir = std::getenv("FST_SSM_DUMP");
+    const bool dumping  = dump_dir && lid == 0 && seq_pos_ == 0;
+    const bool dump_seq = dump_dir && lid == 0;
+    auto dump_f32 = [&](const char* name, const float* p, size_t n) {
+        std::string path = std::string(dump_dir) + "/" + name + ".bin";
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(p), (std::streamsize)(n * sizeof(float)));
+    };
+    auto dump_pos = [&](const char* name, int pos, const float* p, size_t n) {
+        std::string path = std::string(dump_dir) + "/" + name + "_" + std::to_string(pos) + ".bin";
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(p), (std::streamsize)(n * sizeof(float)));
+    };
+    std::vector<float, AlignedAllocator<float>> h_in_dump;
+    if (dump_seq) {
+        h_in_dump.resize(hd);
+        for (int d = 0; d < hd; d++) h_in_dump[d] = bf16f(h[d]);
+    }
+
+    /* 1. input RMSNorm → fp32 [hd]. */
+    std::vector<float, AlignedAllocator<float>> an(hd);
+    q35_rmsnorm(an.data(), h, w.attn_norm.data(), hd, eps);
+
+    /* 2. projections (fused MXFP4 matvec). */
+    std::vector<float, AlignedAllocator<float>> qkv(Cdim), zgate(Vdim), avec(nV), bvec(nV);
+    mxfp4_matvec_f32(qkv.data(),  an.data(), w.ssm_qkv.data(),  Cdim, hd);
+    mxfp4_matvec_f32(zgate.data(), an.data(), w.ssm_gate.data(), Vdim, hd);
+    mxfp4_matvec_f32(avec.data(),  an.data(), w.ssm_alpha.data(), nV, hd);
+    mxfp4_matvec_f32(bvec.data(),  an.data(), w.ssm_beta.data(),  nV, hd);
+
+    /* 3. depthwise causal conv1d (groups=Cdim, kernel=ck) + SiLU, decode-update.
+     *    Matches ggml_ssm_conv (llama.cpp qwen35): conv1d.weight is CHANNEL-OUTER
+     *    W[chan][tap] = w.ssm_conv1d[c*ck + r], shape (d_conv=4, conv_dim).  The
+     *    conv state holds [oldest,…,newest] (index ck-1 = newest), so out[c] =
+     *    Σ_tap W[c][tap]·state[c][tap] with state[ck-1]=x_t (the new token).  This is
+     *    the standard causal conv out[t]=Σ_i W[i]·in[t-(ck-1-i)].  Then SiLU. */
+    auto& conv_st = q35_ssm_state_[lid].conv;
+    if (conv_st.empty()) conv_st.assign((size_t)ck * Cdim, 0.0f);
+    std::vector<float, AlignedAllocator<float>> qkvc(Cdim);
+    for (int c = 0; c < Cdim; c++) {
+        /* shift state toward index 0 (drop oldest at 0), insert newest at ck-1 */
+        for (int r = 0; r < ck - 1; r++) conv_st[(size_t)r * Cdim + c] = conv_st[(size_t)(r + 1) * Cdim + c];
+        conv_st[(size_t)(ck - 1) * Cdim + c] = qkv[c];   /* state[ck-1] = newest */
+        float y = 0.0f;
+        for (int r = 0; r < ck; r++) y += w.ssm_conv1d[(size_t)c * ck + r] * conv_st[(size_t)r * Cdim + c];
+        float sig = 1.0f / (1.0f + std::exp(-y));
+        qkvc[c] = y * sig;                                /* SiLU(y) = y·σ(y) */
+    }
+
+    /* 4. split q|k|v (post-conv).  q,k are [nK, HV]; v is [nV, HV]. */
+    const float* q_raw = qkvc.data();
+    const float* k_raw  = qkvc.data() + Kdim;
+    const float* v_vec = qkvc.data() + 2 * Kdim;
+
+    /* 5. per-v-head decay g_logit + beta.
+     *    HF:  g = -A_log.exp() * softplus(a + dt_bias) ;  beta = sigmoid(b)
+     *    The GGUF tensor `ssm_a` is the PRECOMPUTED -exp(A_log) (always <0) — see
+     *    llama.cpp qwen35 graph: `gate = softplus * ssm_a` (no exp/negate).  So
+     *    g_logit = ssm_a * softplus(a + dt_bias), NOT -exp(ssm_a)*....  (Applying
+     *    exp+negate again yields ~-0.96*sp instead of ~-0.04*sp → gdec≈0 → the
+     *    recurrent state is wiped every step → degenerate empty-turn output.) */
+    std::vector<float, AlignedAllocator<float>> gdec(nV), beta(nV);
+    for (int v = 0; v < nV; v++) {
+        float a_clamp = avec[v] + w.ssm_dt_bias[v];
+        float sp = std::log1pf(std::exp(a_clamp));        /* softplus (numerically soft) */
+        if (a_clamp > 20.0f) sp = a_clamp;                /* softplus→identity for large */
+        float g_logit = w.ssm_a[v] * sp;                  /* ssm_a is already -exp(A_log) */
+        gdec[v] = std::exp(g_logit);
+        beta[v] = 1.0f / (1.0f + std::exp(-bvec[v]));     /* sigmoid(b) */
+    }
+
+    /* 6. l2norm q,k per k-head, then repeat_interleave rep× to v-heads. */
+    std::vector<float, AlignedAllocator<float>> qn(nV * HV), kn(nV * HV);
+    auto l2norm = [&](const float* x, float* o) {
+        float ss = 0.0f; for (int d = 0; d < HV; d++) ss += x[d] * x[d];
+        float rcp = 1.0f / std::sqrt(ss + 1e-6f);
+        for (int d = 0; d < HV; d++) o[d] = x[d] * rcp;
+    };
+    for (int hk = 0; hk < nK; hk++) {
+        float qn_h[1024], kn_h[1024];  /* HV=128 */
+        l2norm(q_raw + hk * HV, qn_h);
+        l2norm(k_raw + hk * HV, kn_h);
+        for (int r = 0; r < rep; r++) {
+            int v = hk * rep + r;
+            for (int d = 0; d < HV; d++) qn[(size_t)v * HV + d] = qn_h[d] * SCALE;
+            for (int d = 0; d < HV; d++) kn[(size_t)v * HV + d] = kn_h[d];
+        }
+    }
+
+    /* 7. GDN recurrence on the NPU (zero-CPU scan), one v-head at a time. */
+    auto& S = q35_ssm_state_[lid].S;     /* [nV*HV*HV] persistent state */
+    if (S.empty()) S.assign((size_t)nV * HV * HV, 0.0f);
+    if (dump_seq) {  /* dump the PRE-step S state (carried from prior positions) */
+        std::vector<float, AlignedAllocator<float>> sprev(S.begin(), S.end());
+        dump_pos("S_pre", seq_pos_, sprev.data(), (size_t)nV * HV * HV);
+    }
+    std::vector<float, AlignedAllocator<float>> y_out((size_t)nV * HV, 0.0f);
+    gdn_scan_vheads(S.data(), qn.data(), kn.data(), v_vec, gdec.data(), beta.data(), y_out.data());
+    if (dump_seq) {  /* dump the POST-step S state (what got persisted). */
+        std::vector<float, AlignedAllocator<float>> spost(S.begin(), S.end());
+        dump_pos("S_post", seq_pos_, spost.data(), (size_t)nV * HV * HV);
+    }
+    std::vector<float, AlignedAllocator<float>> y_scan_dump;   /* raw scan y, pre norm-gated */
+    if (dump_seq) { y_scan_dump.assign(y_out.begin(), y_out.end()); }
+
+    /* 8. group norm (RMSNorm-gated) per v-head over head_v=HV; ssm_norm [HV] shared. */
+    for (int v = 0; v < nV; v++) {
+        float* yv = y_out.data() + (size_t)v * HV;
+        const float* zv = zgate.data() + (size_t)v * HV;
+        float ss = 0.0f; for (int d = 0; d < HV; d++) ss += yv[d] * yv[d];
+        float rcp = 1.0f / std::sqrt(ss / (float)HV + eps);
+        for (int d = 0; d < HV; d++) {
+            float g = zv[d]; float sig = 1.0f / (1.0f + std::exp(-g));
+            yv[d] = yv[d] * rcp * w.ssm_norm[d] * (g * sig);
+        }
+    }
+
+    /* 9. output projection (fused MXFP4 matvec, [hidden]←[Vdim]) + residual. */
+    std::vector<float, AlignedAllocator<float>> out(hd, 0.0f);
+    mxfp4_matvec_f32(out.data(), y_out.data(), w.ssm_out.data(), hd, Vdim);
+    /* snapshot y_normgated (the o_proj input) before the residual add — y_out still
+     * holds the norm-gated values here (step 8 mutated it in place). */
+    std::vector<float, AlignedAllocator<float>> yng;
+    if (dump_seq) {
+        yng.assign((size_t)nV * HV, 0.0f);
+        for (int v = 0; v < nV; v++)
+            for (int d = 0; d < HV; d++) yng[(size_t)v * HV + d] = y_out[(size_t)v * HV + d];
+    }
+    for (int d = 0; d < hd; d++) h[d] = f2bf(bf16f(h[d]) + out[d]);
+
+    std::vector<float, AlignedAllocator<float>> h_out;
+    if (dump_seq) {
+        h_out.assign(hd, 0.0f);
+        for (int d = 0; d < hd; d++) h_out[d] = bf16f(h[d]);
+        const int p = seq_pos_;
+        dump_pos("h_in",        p, h_in_dump.data(), hd);
+        dump_pos("an",          p, an.data(),         hd);
+        dump_pos("qkv",         p, qkv.data(),        Cdim);
+        dump_pos("zgate",       p, zgate.data(),      Vdim);
+        dump_pos("avec",        p, avec.data(),       nV);
+        dump_pos("bvec",        p, bvec.data(),       nV);
+        dump_pos("qkvc",         p, qkvc.data(),       Cdim);
+        dump_pos("gdec",        p, gdec.data(),       nV);
+        dump_pos("beta",        p, beta.data(),       nV);
+        dump_pos("qn",          p, qn.data(),         (size_t)nV * HV);
+        dump_pos("kn",          p, kn.data(),         (size_t)nV * HV);
+        dump_pos("vvec",         p, v_vec,            (size_t)nV * HV);
+        dump_pos("y_scan",      p, y_scan_dump.data(),(size_t)nV * HV);
+        dump_pos("y_normgated",  p, yng.data(),       (size_t)nV * HV);
+        dump_pos("out",         p, out.data(),       hd);
+        dump_pos("h_out",       p, h_out.data(),      hd);
+    }
+    if (dumping) {
+        /* pos-0 static-named dump: weights + intermediates for qwopus_ssm_block_ref.py. */
+        std::vector<float, AlignedAllocator<float>>
+            wqkv((size_t)Cdim * hd), wgate((size_t)Vdim * hd),
+            walpha((size_t)nV * hd), wbeta((size_t)nV * hd), wout((size_t)hd * Vdim);
+        dequant_mxfp4_dense(wqkv.data(),   w.ssm_qkv.data(),   Cdim, hd);
+        dequant_mxfp4_dense(wgate.data(),  w.ssm_gate.data(),  Vdim, hd);
+        dequant_mxfp4_dense(walpha.data(), w.ssm_alpha.data(), nV,   hd);
+        dequant_mxfp4_dense(wbeta.data(),  w.ssm_beta.data(),  nV,   hd);
+        dequant_mxfp4_dense(wout.data(),   w.ssm_out.data(),   hd,   Vdim);
+        std::vector<float, AlignedAllocator<float>> attn_norm_f(hd);
+        for (int d = 0; d < hd; d++) attn_norm_f[d] = bf16f(w.attn_norm[d]);
+        dump_f32("w_attn_norm", attn_norm_f.data(), hd);
+        dump_f32("w_ssm_qkv",   wqkv.data(),       (size_t)Cdim * hd);
+        dump_f32("w_ssm_gate",  wgate.data(),      (size_t)Vdim * hd);
+        dump_f32("w_ssm_alpha", walpha.data(),     (size_t)nV * hd);
+        dump_f32("w_ssm_beta",  wbeta.data(),      (size_t)nV * hd);
+        dump_f32("w_ssm_out",   wout.data(),       (size_t)hd * Vdim);
+        dump_f32("w_ssm_conv1d", w.ssm_conv1d.data(), (size_t)ck * Cdim);
+        dump_f32("w_ssm_a",     w.ssm_a.data(),     nV);
+        dump_f32("w_ssm_dt_bias", w.ssm_dt_bias.data(), nV);
+        dump_f32("w_ssm_norm",  w.ssm_norm.data(),  HV);
+        /* pos-0 chain under the static names the existing ref reads. */
+        dump_f32("h_in",        h_in_dump.data(),  hd);
+        dump_f32("an",          an.data(),         hd);
+        dump_f32("qkv",  qkv.data(),  Cdim);
+        dump_f32("zgate",zgate.data(),Vdim);
+        dump_f32("avec", avec.data(), nV);
+        dump_f32("bvec", bvec.data(), nV);
+        dump_f32("qkvc", qkvc.data(), Cdim);
+        dump_f32("gdec", gdec.data(), nV);
+        dump_f32("beta", beta.data(), nV);
+        dump_f32("qn",   qn.data(),   (size_t)nV * HV);
+        dump_f32("kn",   kn.data(),   (size_t)nV * HV);
+        dump_f32("vvec", v_vec,       (size_t)nV * HV);
+        dump_f32("y_scan", y_scan_dump.data(), (size_t)nV * HV);
+        dump_f32("y_normgated", yng.data(), (size_t)nV * HV);
+        dump_f32("out",  out.data(),  hd);
+        dump_f32("h_out", h_out.data(), hd);
+        fprintf(stderr, "[ssm-dump] layer 0 pos %d -> %s\n", seq_pos_, dump_dir);
+        fflush(stderr);
+    }
+}
+
+/* GDN recurrence over ALL 48 v-heads in ONE AIE dispatch per SSM layer
+ * (kernels/gen_gdn_fused.py + fst_gdn_fused_kernel.cc).  The fused Worker loops
+ * all 48 v-heads internally, running passA (16 blocks) → delta (once) → passB
+ * (16 blocks) against a held tile scratch [a|b|delta|y], streaming S0 from DDR
+ * TWICE per v-head (the 64 KB state does not fit in a 64 KB tile).  Was 3
+ * xrt::run/layer (144 dispatches/token); now 1 xrt::run/layer (48/token).
+ *
+ * BO layout (all fp32):
+ *   spkt : nV*32 blocks × 1088 (8 rows × 136), block m = v*32 + pass*16 + b.
+ *          row = [S_row(128) | kn_i@128 | qn_i@129 | gdec@130 | pad(5)].
+ *          passA reads kn_i,qn_i; passB reads kn_i,gdec — same row layout both.
+ *   par  : nV × 386 = [v(128) | kn(128) | qn(128) | gdec@384 | beta@385].
+ *   s2   : nV*16 blocks × 1024 (8 rows × 128), block m = v*16 + b → updated S.
+ *   y    : nV × 1024, held scratch drain; engine reads y at offset 384.
+ * Bit-correct vs the 3-pass path is validated by scripts/qwopus_ssm_recur_ref.py
+ * (recurrent over all prefill positions, y_scan max|Δ|≈1e-6). */
+void FSTEngine::gdn_scan_vheads(float* S, const float* qn, const float* kn,
+                                const float* v_in, const float* gdec, const float* beta,
+                                float* y_out) {
+    const int HV   = config_.ssm_state_dim;        /* 128 */
+    const int nV   = config_.ssm_n_vheads;        /* 48  */
+    constexpr int NROWS = 128;                      /* rows per v-head (S is [128,128]) */
+    constexpr int PKT_A = 130;                      /* passA row [S(128)|kn_i|qn_i]       */
+    constexpr int PKT_B = 264;                      /* passB row [S(128)|delta(128)|kn_i|gdec|pad(5)] */
+    constexpr int DELTA_IN  = 642;                  /* delta in [a|b|v|kn|qn|gdec@640|beta@641] */
+    constexpr int OUTPKT = 1024;                    /* 1024-float drain packet (proven geometry) */
+    constexpr int ROWS_PER_PKT_B = 8;              /* passB packs 8 rows per block            */
+    constexpr int NPKT_B_V = NROWS / ROWS_PER_PKT_B;/* 16 passB blocks per v-head             */
+
+    /* ---- FUSED single-dispatch path: 1 xrt::run/SSM-layer (48 dispatches/token).
+     * Gate FST_Q35_GDN_FUSED=1.  A3 v2: 1 MM2S + 1 S2MM (3-pass passA channel
+     * budget) — fixes both race mechanisms.  Packs 2 contiguous BOs (block k @
+     * k*size; the generator's TAP splits only satisfy BD repeat<=255 — the
+     * layout is contiguous).  State S held on-chip across passA/delta/passB
+     * (no inter-pass DDR round-trip).  FST_GDN_DUMP_SCR dumps spkt/out for
+     * scripts/cmp_fused_ab.py (correctness diagnosis). */
+    static const bool use_fused = std::getenv("FST_Q35_GDN_FUSED") != nullptr;
+    if (use_fused) {
+        constexpr int NBLK = 128, BLK = 136, OUTPKT_F = 1024, NPPARAM = 3, NPKT_VH = 259;
+        if (!q35_gdn_fused_bos_ready_) {
+            q35_bo_fused_spkt_ = xrt::ext::bo(npu_device_, (size_t)nV * NPKT_VH * BLK * 4);
+            q35_bo_fused_out_  = xrt::ext::bo(npu_device_, (size_t)nV * (2 * NBLK + 1) * OUTPKT_F * 4);
+            q35_gdn_fused_bos_ready_ = true;
+        }
+        /* spkt: per v-head 259 packets = [pkt_v][pkt_kn][pkt_qn][128 passA rows][128 passB rows].
+         * pkt_v=[v(128)|gdec@128|beta@129|pad]; pkt_kn/qn=[vec(128)|pad];
+         * row=[S0(128)|kn_i@128|qn_i@129|gdec@130|pad] (passA+passB share layout; S0 streamed twice). */
+        float* spkt = q35_bo_fused_spkt_.map<float*>();
+        for (int v = 0; v < nV; v++) {
+            const float* S0v = S  + (size_t)v * HV * HV;
+            const float* knv = kn + (size_t)v * HV;
+            const float* qnv = qn + (size_t)v * HV;
+            const float* vv  = v_in + (size_t)v * HV;
+            const float  g   = gdec[v];
+            const float  bt  = beta[v];
+            const size_t base = (size_t)v * NPKT_VH;
+            float* pv = spkt + base * BLK;          /* pkt_v */
+            for (int j = 0; j < HV; j++) pv[j] = vv[j];
+            pv[HV + 0] = g;   pv[HV + 1] = bt;      /* gdec@128, beta@129 */
+            float* pk = spkt + (base + 1) * BLK;    /* pkt_kn */
+            for (int j = 0; j < HV; j++) pk[j] = knv[j];
+            float* pq = spkt + (base + 2) * BLK;    /* pkt_qn */
+            for (int j = 0; j < HV; j++) pq[j] = qnv[j];
+            for (int i = 0; i < NBLK; i++) {
+                float* rowA = spkt + (base + NPPARAM + i) * BLK;
+                for (int j = 0; j < HV; j++) rowA[j] = S0v[(size_t)i * HV + j];
+                rowA[HV + 0] = knv[i];  rowA[HV + 1] = qnv[i];  rowA[HV + 2] = g;
+                float* rowB = spkt + (base + NPPARAM + NBLK + i) * BLK;
+                for (int j = 0; j < HV; j++) rowB[j] = S0v[(size_t)i * HV + j];
+                rowB[HV + 0] = knv[i];  rowB[HV + 1] = qnv[i];  rowB[HV + 2] = g;
+            }
+        }
+        npu_sync_to(static_cast<xrt::bo&>(q35_bo_fused_spkt_));
+        {
+            float* o = q35_bo_fused_out_.map<float*>();
+            std::memset(o, 0, (size_t)nV * (2 * NBLK + 1) * OUTPKT_F * 4);
+        }
+        npu_sync_to(static_cast<xrt::bo&>(q35_bo_fused_out_));
+        {
+            xrt::bo* args[2] = { &static_cast<xrt::bo&>(q35_bo_fused_spkt_),
+                                 &static_cast<xrt::bo&>(q35_bo_fused_out_) };
+            kernel_cache_->run_registered_blob("q35_gdn_fused", args, 2).wait();
+        }
+        npu_sync_from(static_cast<xrt::bo&>(q35_bo_fused_out_));
+        if (const char* e = std::getenv("FST_GDN_DUMP_SCR")) {
+            static int gdn_call = 0;
+            if (gdn_call < 64) {
+                std::string base = std::string(e) + "/call" + std::to_string(gdn_call);
+                std::ofstream(base + "_out.bin").write((const char*)q35_bo_fused_out_.map<float*>(),
+                                                        (size_t)nV * (2 * NBLK + 1) * OUTPKT_F * 4);
+                std::ofstream(base + "_spkt.bin").write((const char*)spkt,
+                                                        (size_t)nV * NPKT_VH * BLK * 4);
+                gdn_call++;
+            }
+        }
+        /* unpack: drain order per v-head = [128 S2 rows, 1 y].
+         * S2[v][i] @ (v*129+i)*1024 (first 128); y[v] @ (v*129+128)*1024 + 384. */
+        const float* out = q35_bo_fused_out_.map<float*>();
+        constexpr int STRIDE = 2 * NBLK + 1;   /* 129 */
+        for (int v = 0; v < nV; v++) {
+            for (int i = 0; i < NBLK; i++)
+                std::memcpy(S + (size_t)v * HV * HV + (size_t)i * HV,
+                            out + ((size_t)v * STRIDE + i) * OUTPKT_F, (size_t)HV * 4);
+            std::memcpy(y_out + (size_t)v * HV,
+                        out + ((size_t)v * STRIDE + NBLK) * OUTPKT_F + 384, (size_t)HV * 4);
+        }
+        return;
+    }
+
+    if (!q35_gdn_bos_ready_) {
+        q35_bo_pA_in_  = xrt::ext::bo(npu_device_, (size_t)nV * NROWS * PKT_A * 4);
+        q35_bo_pA_out_ = xrt::ext::bo(npu_device_, (size_t)nV * OUTPKT * 4);
+        q35_bo_d_in_   = xrt::ext::bo(npu_device_, (size_t)nV * DELTA_IN * 4);
+        q35_bo_d_out_  = xrt::ext::bo(npu_device_, (size_t)nV * OUTPKT * 4);
+        q35_bo_pB_in_  = xrt::ext::bo(npu_device_, (size_t)nV * NROWS * PKT_B * 4);
+        q35_bo_pB_out_ = xrt::ext::bo(npu_device_, (size_t)nV * NROWS * HV * 4);
+        q35_gdn_bos_ready_ = true;
+    }
+
+    /* ---- passA: pack [v][i][130] = [S0[i,0:128]|kn_v[i]|qn_v[i]] ---- */
+    float* pAin = q35_bo_pA_in_.map<float*>();
+    for (int v = 0; v < nV; v++) {
+        const float* S0  = S   + (size_t)v * HV * HV;
+        const float* knv = kn  + (size_t)v * HV;
+        const float* qnv = qn  + (size_t)v * HV;
+        for (int i = 0; i < NROWS; i++) {
+            float* row = pAin + ((size_t)v * NROWS + i) * PKT_A;
+            for (int j = 0; j < HV; j++) row[j] = S0[(size_t)i * HV + j];
+            row[HV + 0] = knv[i];
+            row[HV + 1] = qnv[i];
+        }
+    }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_pA_in_));
+    { float* o = q35_bo_pA_out_.map<float*>(); std::memset(o, 0, (size_t)nV * OUTPKT * 4); }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_pA_out_));
+    {
+        xrt::bo* args[2] = { &static_cast<xrt::bo&>(q35_bo_pA_in_),
+                            &static_cast<xrt::bo&>(q35_bo_pA_out_) };
+        kernel_cache_->run_registered_blob("q35_gdn_passA", args, 2).wait();
+    }
+    npu_sync_from(static_cast<xrt::bo&>(q35_bo_pA_out_));
+    const float* pAout = q35_bo_pA_out_.map<float*>();   /* [v][1024]: a@0, b@128 */
+
+    /* ---- delta: pack [v][642] = [a|b|v|kn|qn|gdec@640|beta@641] ---- */
+    float* din = q35_bo_d_in_.map<float*>();
+    for (int v = 0; v < nV; v++) {
+        const float* ab = pAout + (size_t)v * OUTPKT;
+        float* d = din + (size_t)v * DELTA_IN;
+        std::memcpy(d + 0,   ab + 0,   (size_t)HV * 4);   /* a */
+        std::memcpy(d + 128, ab + 128, (size_t)HV * 4);   /* b */
+        std::memcpy(d + 256, v_in + (size_t)v * HV, (size_t)HV * 4);
+        std::memcpy(d + 384, kn   + (size_t)v * HV, (size_t)HV * 4);
+        std::memcpy(d + 512, qn   + (size_t)v * HV, (size_t)HV * 4);
+        d[640] = gdec[v];
+        d[641] = beta[v];
+    }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_d_in_));
+    { float* o = q35_bo_d_out_.map<float*>(); std::memset(o, 0, (size_t)nV * OUTPKT * 4); }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_d_out_));
+    {
+        xrt::bo* args[2] = { &static_cast<xrt::bo&>(q35_bo_d_in_),
+                            &static_cast<xrt::bo&>(q35_bo_d_out_) };
+        kernel_cache_->run_registered_blob("q35_gdn_delta", args, 2).wait();
+    }
+    npu_sync_from(static_cast<xrt::bo&>(q35_bo_d_out_));
+    const float* dout = q35_bo_d_out_.map<float*>();     /* [v][1024]: delta@0, y@128 */
+    /* copy y out now (delta lives in the kernel's 642-in, but passB needs delta in pB_in) */
+    for (int v = 0; v < nV; v++)
+        std::memcpy(y_out + (size_t)v * HV, dout + (size_t)v * OUTPKT + 128, (size_t)HV * 4);
+
+    /* ---- passB: pack 768 blocks of 2112 = [v][b][r][264]: [S0(128)|delta(128)|kn_i|gdec|pad] ---- */
+    float* pBin = q35_bo_pB_in_.map<float*>();
+    for (int v = 0; v < nV; v++) {
+        const float* S0     = S   + (size_t)v * HV * HV;
+        const float* knv     = kn  + (size_t)v * HV;
+        const float* deltav  = dout + (size_t)v * OUTPKT;   /* delta@0 */
+        const float  g       = gdec[v];
+        for (int b = 0; b < NPKT_B_V; b++) {
+            float* blk = pBin + ((size_t)v * NPKT_B_V + b) * (ROWS_PER_PKT_B * PKT_B);
+            for (int r = 0; r < ROWS_PER_PKT_B; r++) {
+                const int i = b * ROWS_PER_PKT_B + r;
+                float* row = blk + (size_t)r * PKT_B;
+                for (int j = 0; j < HV; j++) row[j] = S0[(size_t)i * HV + j];     /* S0 */
+                for (int j = 0; j < HV; j++) row[HV + j] = deltav[j];             /* delta */
+                row[2 * HV + 0] = knv[i];                                          /* kn_i@256 */
+                row[2 * HV + 1] = g;                                               /* gdec@257 */
+            }
+        }
+    }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_pB_in_));
+    { float* o = q35_bo_pB_out_.map<float*>(); std::memset(o, 0, (size_t)nV * NROWS * HV * 4); }
+    npu_sync_to(static_cast<xrt::bo&>(q35_bo_pB_out_));
+    {
+        xrt::bo* args[2] = { &static_cast<xrt::bo&>(q35_bo_pB_in_),
+                            &static_cast<xrt::bo&>(q35_bo_pB_out_) };
+        kernel_cache_->run_registered_blob("q35_gdn_passB", args, 2).wait();
+    }
+    npu_sync_from(static_cast<xrt::bo&>(q35_bo_pB_out_));
+
+    /* unpack updated S2: 768 blocks of 1024 = [v][b][r][128] -> S[v][i][128]. */
+    const float* pBout = q35_bo_pB_out_.map<float*>();
+    if (const char* e = std::getenv("FST_GDN_DUMP_SCR")) {
+        static int gdn_call = 0;
+        std::string base = std::string(e) + "/call" + std::to_string(gdn_call++);
+        std::ofstream(base + "_y.bin").write((const char*)dout, (size_t)nV * OUTPKT * 4);
+        std::ofstream(base + "_s2.bin").write((const char*)pBout, (size_t)nV * NROWS * HV * 4);
+        std::ofstream(base + "_pAin.bin").write((const char*)pAin, (size_t)nV * NROWS * PKT_A * 4);
+        std::ofstream(base + "_din.bin").write((const char*)din, (size_t)nV * DELTA_IN * 4);
+        std::ofstream(base + "_pBin.bin").write((const char*)pBin, (size_t)nV * NROWS * PKT_B * 4);
+    }
+    for (int v = 0; v < nV; v++) {
+        for (int b = 0; b < NPKT_B_V; b++)
+            for (int r = 0; r < ROWS_PER_PKT_B; r++) {
+                const int i = b * ROWS_PER_PKT_B + r;
+                std::memcpy(S + (size_t)v * HV * HV + (size_t)i * HV,
+                            pBout + ((size_t)v * NPKT_B_V + b) * (ROWS_PER_PKT_B * HV) + (size_t)r * HV,
+                            (size_t)HV * 4);
+            }
+    }
+
+    /* A/B experiment (FST_Q35_GDN_BF16S): simulate the chunkwise M=K kernel's
+     * on-tile bf16-S storage by truncating the carried GDN state to bf16
+     * (engine convention: uint32 u & 0xffff0000) after every update.  fp32
+     * compute (the kernel matvecs run in fp32 on the bf16-rounded values) +
+     * bf16 storage = the standard fp32-accumulator/bf16-storage mitigation.
+     * Read-only experiment behind an env flag; the 3-pass math is unchanged
+     * when the flag is unset.  Decisive losslessness gate for the chunkwise
+     * parallel-scan GDN path (see docs / memory qwopus-parallel-scan-gdn). */
+    if (std::getenv("FST_Q35_GDN_BF16S")) {
+        const size_t n = (size_t)nV * HV * HV;
+        for (size_t k = 0; k < n; k++) {
+            uint32_t u; std::memcpy(&u, S + k, 4);
+            u &= 0xffff0000u;
+            std::memcpy(S + k, &u, 4);
+        }
+    }
+}
+
+void FSTEngine::process_gqa_q35(int lid, bf16_t* h, int /*M*/) {
+    auto& w = q35_shared_[lid];
+    const int hd   = config_.hidden_dim;       /* 5120 */
+    const int nq   = config_.num_q_heads;      /* 24  */
+    const int nkv  = config_.num_kv_heads;     /* 4   */
+    const int dh   = config_.head_dim;         /* 256 */
+    const int qrow = nq * dh;                   /* 6144 (query only) */
+    const int kvrow = nkv * dh;                 /* 1024 */
+    const int S = seq_pos_ + 1;                 /* cache rows after append (M=1) */
+    const float scale = 1.0f / std::sqrt((float)dh);
+    const float eps = config_.rms_eps;
+    /* qwen35 full-attn RoPE: ggml_rope_multi with rope.dimension_sections=[11,11,10,0].
+     * For text (all 4 section positions equal) this reduces to NeoX rotate-half over
+     * the first n_rot dims, passthrough the rest.  n_rot = 64 — the GGUF key
+     * qwen35.rope.dimension_count=64 (llama.cpp n_rot_full, overrides the head_dim
+     * default).  So pair j (0..31) with j+32, dims 64..255 untouched.
+     * freq_j = freq_base^(-2j/n_rot).  (The .fst header has no rope_dim slot, so this
+     * is the per-model value baked into the converter source of truth.) */
+    const int n_rot   = 64;                      /* qwen35.rope.dimension_count */
+    const int halfrot = n_rot / 2;                /* 32  */
+
+    /* FST_GQA_DUMP: dump every intermediate tensor for the FIRST GQA layer (L3)
+     * at position 0, to compare against HuggingFace qwen3_next (scripts/
+     * qwopus_gqa_ref.py).  Dumps are fp32 .bin under $FST_GQA_DUMP/L{lid}_p{pos}_*. */
+    const char* gqa_dump_dir = (lid == 3 && seq_pos_ == 0) ? std::getenv("FST_GQA_DUMP") : nullptr;
+    auto dumpf = [&](const char* name, const float* p, size_t n) {
+        if (!gqa_dump_dir) return;
+        std::string path = std::string(gqa_dump_dir) + "/L" + std::to_string(lid)
+                         + "_p" + std::to_string(seq_pos_) + "_" + name + ".bin";
+        std::ofstream(path).write((const char*)p, n * sizeof(float));
+    };
+    /* One-time weight dump (raw MXFP4 bytes + fp32/bf16 norms) so the numpy ref
+     * can recompute every stage with the EXACT same weights the engine uses. */
+    if (gqa_dump_dir) {
+        auto dump_raw = [&](const char* name, const uint8_t* p, size_t n) {
+            std::string path = std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_" + name + ".bin";
+            std::ofstream(path).write((const char*)p, n);
+        };
+        dump_raw("w_q_proj.mxfp4", w.q_proj.data(), w.q_proj.size());
+        dump_raw("w_k_proj.mxfp4", w.k_proj.data(), w.k_proj.size());
+        dump_raw("w_v_proj.mxfp4", w.v_proj.data(), w.v_proj.size());
+        dump_raw("w_o_proj.mxfp4", w.o_proj.data(), w.o_proj.size());
+        dump_raw("w_ffn_gate.mxfp4", w.ffn_gate.data(), w.ffn_gate.size());
+        dump_raw("w_ffn_up.mxfp4", w.ffn_up.data(), w.ffn_up.size());
+        dump_raw("w_ffn_down.mxfp4", w.ffn_down.data(), w.ffn_down.size());
+        std::vector<float> tmpf(hd);
+        for (int d = 0; d < hd; d++) tmpf[d] = bf16f(w.attn_norm[d]);
+        std::ofstream(std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_w_attn_norm.bin")
+            .write((const char*)tmpf.data(), hd * sizeof(float));
+        for (int d = 0; d < hd; d++) tmpf[d] = bf16f(w.ffn_norm[d]);
+        std::ofstream(std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_w_ffn_norm.bin")
+            .write((const char*)tmpf.data(), hd * sizeof(float));
+        std::ofstream(std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_w_q_norm.bin")
+            .write((const char*)w.q_norm.data(), w.q_norm.size() * sizeof(float));
+        std::ofstream(std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_w_k_norm.bin")
+            .write((const char*)w.k_norm.data(), w.k_norm.size() * sizeof(float));
+        fprintf(stderr, "[gqa_dump] weights+norms for L%d written to %s\n", lid, gqa_dump_dir); fflush(stderr);
+        std::ofstream meta(std::string(gqa_dump_dir) + "/L" + std::to_string(lid) + "_meta.txt");
+        meta << "lid " << lid << " pos " << seq_pos_ << "\n"
+             << "hd " << hd << " nq " << nq << " nkv " << nkv << " dh " << dh
+             << " n_rot " << n_rot << " inter " << config_.expert_inter_dim << "\n"
+             << "rms_eps " << eps << " rope_freq_base " << rope_freq_base_ << "\n"
+             << "scale " << scale << "\n";
+    }
+
+    /* 1. input RMSNorm → fp32. */
+    std::vector<float, AlignedAllocator<float>> an(hd);
+    q35_rmsnorm(an.data(), h, w.attn_norm.data(), hd, eps);
+    if (gqa_dump_dir) {
+        std::vector<float> hin(hd); for (int d = 0; d < hd; d++) hin[d] = bf16f(h[d]);
+        dumpf("residual_in", hin.data(), hd);
+        dumpf("attn_norm_out", an.data(), hd);
+    }
+
+    /* 2. q/k/v projections (fused MXFP4 matvec).  q_proj is DOUBLED [q|gate] per
+     *    head (llama.cpp create_tensor_qkv: n_embd_head_k*n_head*2 = 256*24*2 =
+     *    12288 rows), laid out [h0_q(256)|h0_gate(256)|h1_q|h1_gate|...].  k/v are
+     *    [nkv*dh,hd] (not doubled).  De-interleave q and gate. */
+    std::vector<float, AlignedAllocator<float>> q(qrow), gate(qrow), k(kvrow), v(kvrow);
+    {
+        const int qrow_full = nq * dh * 2;        /* 12288 */
+        std::vector<float, AlignedAllocator<float>> qg(qrow_full);
+        mxfp4_matvec_f32(qg.data(), an.data(), w.q_proj.data(), qrow_full, hd);
+        for (int hq = 0; hq < nq; hq++) {
+            const float* qp = qg.data() + (size_t)hq * 2 * dh;
+            std::memcpy(q.data()    + (size_t)hq * dh, qp,        (size_t)dh * sizeof(float));
+            std::memcpy(gate.data() + (size_t)hq * dh, qp + dh,  (size_t)dh * sizeof(float));
+        }
+    }
+    mxfp4_matvec_f32(k.data(), an.data(), w.k_proj.data(), kvrow, hd);
+    mxfp4_matvec_f32(v.data(), an.data(), w.v_proj.data(), kvrow, hd);
+    dumpf("q_proj", q.data(), qrow);
+    dumpf("q_gate", gate.data(), qrow);
+    dumpf("k_proj", k.data(), kvrow);
+    dumpf("v_proj", v.data(), kvrow);
+
+    /* 3. per-head Q/K RMSNorm (d=dh=256), fp32, weight q_norm/k_norm [dh] shared. */
+    auto rmsnorm_head = [&](float* x, const float* wg) {
+        float ss = 0.0f; for (int d = 0; d < dh; d++) ss += x[d] * x[d];
+        float rcp = 1.0f / std::sqrt(ss / (float)dh + eps);
+        for (int d = 0; d < dh; d++) x[d] = x[d] * rcp * wg[d];
+    };
+    for (int hq = 0; hq < nq; hq++)  rmsnorm_head(q.data() + hq * dh, w.q_norm.data());
+    for (int hk = 0; hk < nkv; hk++) rmsnorm_head(k.data() + hk * dh, w.k_norm.data());
+    dumpf("q_postqknorm", q.data(), qrow);
+    dumpf("k_postqknorm", k.data(), kvrow);
+
+    /* 4. RoPE (ggml_rope_multi / GGML_ROPE_TYPE_MROPE) per head, per position.
+     *    NeoX rotate-half over the first n_rot=64 dims: pair (j, j+32), j=0..31.
+     *    dims [64,256) are passthrough (untouched).  freq_base 1e7, no YaRN. */
+    auto rope_head = [&](float* x, int pos) {
+        for (int j = 0; j < halfrot; j++) {
+            float freq = 1.0f / std::pow(rope_freq_base_, 2.0f * (float)j / (float)n_rot);
+            float ang = (float)pos * freq;
+            float cf = std::cos(ang), sf = std::sin(ang);
+            float a = x[j], b = x[j + halfrot];
+            x[j]            = a * cf - b * sf;
+            x[j + halfrot]  = b * cf + a * sf;
+        }
+        /* dims [n_rot, dh) untouched (already in place) */
+    };
+    const int pos = seq_pos_;
+    for (int hq = 0; hq < nq; hq++)  rope_head(q.data() + hq * dh, pos);
+    for (int hk = 0; hk < nkv; hk++) rope_head(k.data() + hk * dh, pos);
+    dumpf("q_postrope", q.data(), qrow);
+    dumpf("k_postrope", k.data(), kvrow);
+
+    /* 5. append K/V to the GQA cache (bf16). */
+    auto& kv = q35_kv_cache_[lid];
+    bf16_t* krow = kv.k.data() + (size_t)pos * kvrow;
+    bf16_t* vrow = kv.v.data() + (size_t)pos * kvrow;
+    for (int i = 0; i < kvrow; i++) { krow[i] = f2bf(k[i]); vrow[i] = f2bf(v[i]); }
+    kv.n = S;
+
+    /* 6. GQA causal attention (M=1): query at abs pos attends to keys 0..pos. */
+    std::vector<float, AlignedAllocator<float>> out(qrow, 0.0f);
+    const int group = nq / nkv;   /* 6 Q heads share one KV head */
+    const int nkeys = pos + 1;
+    std::vector<float, AlignedAllocator<float>> scores(nkeys), prob(nkeys);
+    std::vector<float, AlignedAllocator<float>> sc_dump, pr_dump;   /* per-head [nq*nkeys] */
+    if (gqa_dump_dir) { sc_dump.resize((size_t)nq * nkeys); pr_dump.resize((size_t)nq * nkeys); }
+    for (int hq = 0; hq < nq; hq++) {
+        const int kvh = hq / group;
+        const float* qh = q.data() + hq * dh;
+        const bf16_t* kbase = kv.k.data() + (size_t)kvh * dh;   /* stride kvrow */
+        const bf16_t* vbase = kv.v.data() + (size_t)kvh * dh;
+        float mx = -1e30f;
+        for (int kk = 0; kk < nkeys; kk++) {
+            const bf16_t* kr = kbase + (size_t)kk * kvrow;
+            float s = 0.0f; for (int d = 0; d < dh; d++) s += qh[d] * bf16f(kr[d]);
+            s *= scale; scores[kk] = s; if (s > mx) mx = s;
+        }
+        float sum = 0.0f;
+        for (int kk = 0; kk < nkeys; kk++) { float p = std::exp(scores[kk] - mx); prob[kk] = p; sum += p; }
+        float inv = 1.0f / (sum + 1e-20f);
+        float* outh = out.data() + hq * dh;
+        for (int kk = 0; kk < nkeys; kk++) {
+            float pv = prob[kk] * inv;
+            const bf16_t* vr = vbase + (size_t)kk * kvrow;
+            for (int d = 0; d < dh; d++) outh[d] += pv * bf16f(vr[d]);
+        }
+        if (gqa_dump_dir) {
+            for (int kk = 0; kk < nkeys; kk++) {
+                sc_dump[(size_t)hq * nkeys + kk] = scores[kk];
+                pr_dump[(size_t)hq * nkeys + kk] = prob[kk] * inv;
+            }
+        }
+    }
+    dumpf("attn_scores", sc_dump.data(), sc_dump.size());
+    dumpf("attn_softmax", pr_dump.data(), pr_dump.size());
+    dumpf("attn_out", out.data(), qrow);
+
+    /* 7. apply q-sigmoid-gate (qwen3.5 gate per Q head: out *= σ(gate)) then
+     *    output projection (fused MXFP4 matvec, [hd]←[qrow]) + residual. */
+    for (int hq = 0; hq < nq; hq++) {
+        float* oh = out.data() + hq * dh;
+        const float* gh = gate.data() + hq * dh;
+        for (int d = 0; d < dh; d++) oh[d] *= 1.0f / (1.0f + std::exp(-gh[d]));
+    }
+    dumpf("attn_gated", out.data(), qrow);
+    std::vector<float, AlignedAllocator<float>> o(hd, 0.0f);
+    mxfp4_matvec_f32(o.data(), out.data(), w.o_proj.data(), hd, qrow);
+    dumpf("o_proj", o.data(), hd);
+    for (int d = 0; d < hd; d++) h[d] = f2bf(bf16f(h[d]) + o[d]);
+    if (gqa_dump_dir) {
+        std::vector<float> hout(hd); for (int d = 0; d < hd; d++) hout[d] = bf16f(h[d]);
+        dumpf("attn_residual_out", hout.data(), hd);
+    }
+}
+
+void FSTEngine::process_ffn_q35(int lid, bf16_t* h, int /*M*/) {
+    auto& w = q35_shared_[lid];
+    const int hd   = config_.hidden_dim;
+    const int inter = config_.expert_inter_dim;   /* 17408 */
+    const float eps = config_.rms_eps;
+
+    /* FST_GQA_DUMP: same gate as process_gqa_q35 (first GQA layer L3, pos 0). */
+    const char* gqa_dump_dir = (lid == 3 && seq_pos_ == 0) ? std::getenv("FST_GQA_DUMP") : nullptr;
+    auto dumpf = [&](const char* name, const float* p, size_t n) {
+        if (!gqa_dump_dir) return;
+        std::string path = std::string(gqa_dump_dir) + "/L" + std::to_string(lid)
+                         + "_p" + std::to_string(seq_pos_) + "_" + name + ".bin";
+        std::ofstream(path).write((const char*)p, n * sizeof(float));
+    };
+
+    /* 1. post-attn RMSNorm → fp32. */
+    std::vector<float, AlignedAllocator<float>> an(hd);
+    q35_rmsnorm(an.data(), h, w.ffn_norm.data(), hd, eps);
+    if (gqa_dump_dir) {
+        std::vector<float> hin(hd); for (int d = 0; d < hd; d++) hin[d] = bf16f(h[d]);
+        dumpf("ffn_residual_in", hin.data(), hd);
+        dumpf("ffn_norm_out", an.data(), hd);
+    }
+
+    /* 2. dense SwiGLU: gate·silu(up) → down.  Fused MXFP4 matvec (no scratch). */
+    std::vector<float, AlignedAllocator<float>> g(inter), u(inter), s(inter);
+    /* Host MXFP4 matvec path (mxfp4_matvec_f32, OpenMP #pragma omp parallel for
+     * => 10.7ms/matvec across cores).  The M=1 NPU FFN path (FST_Q35_FFN_NPU) was
+     * reverted: emulated bfp16 mmul 33ms > 10.7ms host (3.26x slower) + the native
+     * bf16 mmul has the -4 register underflow an M=1 argmax cannot tolerate.  The
+     * kernel artifacts stay for the future M=K SD-verify path (the native GEMM -4
+     * is tolerable at M>=4, cos 0.9988 dilution).  See
+     * docs/QWOPUS_FFN_NPU_WIRED_POSTMORTEM.md. */
+    mxfp4_matvec_f32(g.data(), an.data(), w.ffn_gate.data(), inter, hd);
+    mxfp4_matvec_f32(u.data(), an.data(), w.ffn_up.data(),  inter, hd);
+    dumpf("ffn_gate", g.data(), inter);
+    dumpf("ffn_up",   u.data(), inter);
+    for (int i = 0; i < inter; i++) {
+        float sig = 1.0f / (1.0f + std::exp(-g[i]));
+        s[i] = g[i] * sig * u[i];                  /* silu(gate) * up */
+    }
+    dumpf("ffn_swiglu", s.data(), inter);
+    std::vector<float, AlignedAllocator<float>> out(hd, 0.0f);
+    mxfp4_matvec_f32(out.data(), s.data(), w.ffn_down.data(), hd, inter);
+    dumpf("ffn_down", out.data(), hd);
+
+    /* 3. residual. */
+    for (int d = 0; d < hd; d++) h[d] = f2bf(bf16f(h[d]) + out[d]);
+    if (gqa_dump_dir) {
+        std::vector<float> hout(hd); for (int d = 0; d < hd; d++) hout[d] = bf16f(h[d]);
+        dumpf("ffn_residual_out", hout.data(), hd);
+    }
+}
+
+/* ── M=8 NPU FFN (fst_qwopus_ffn_m8, 16-tile N-split) ──────────────────────────
+ * Geometry must match kernels/fst_qwopus_ffn_m8_kernel.cc + gen_qwopus_ffn_m8.py:
+ *   MH=8 h-vectors, M_n=16 outputs/packet, G=16 groups/packet, HDR=32, NT=16
+ *   tiles, N_TILE_C=1088 (compiled for the up shape N=17408/16).  PKT=12576 B
+ *   (32 hdr + 8192 8x bf16 h-chunks + 256 scales + 4096 nibbles).  NPKT=680/tile.
+ *   Serves BOTH shapes from ONE xclbin: up [N=17408,K=5120] N_TILE_USED=1088
+ *   (GROUPS=160,KCHUNKS=10,NCHUNKS=68); down [N=5120,K=17408] N_TILE_USED=320
+ *   (GROUPS=544,KCHUNKS=34,NCHUNKS=20).  Both NPKT=680.  Output read back per
+ *   h-vector: outNpu[m][n]=outFull[t*MH*N_TILE_C + m*N_TILE_C + (n%N_TILE_USED)]
+ *   with t=n/N_TILE_USED.  The weight MXFP4 layout (17 B blocks: 1 e8m0 scale +
+ *   16 nibble bytes) is identical to the engine's, so scales/nibbles are a
+ *   memcpy of the row's block (no reformat).  See tools/qwopus_ffn_m8_probe.cpp
+ *   + docs/QWOPUS_FFN_M8_SD_POSTMORTEM.md. */
+static constexpr int M8_MH = 8, M8_MN = 16, M8_G = 16, M8_HDR = 32, M8_NT = 16;
+static constexpr int M8_NTC = 1088;                                   /* compiled N_TILE */
+static constexpr int M8_HB  = M8_MH * M8_G * 32 * 2;                  /* 8192 */
+static constexpr int M8_SCB = M8_MN * M8_G;                           /* 256 */
+static constexpr int M8_NBB = M8_MN * M8_G * 16;                      /* 4096 */
+static constexpr int M8_PKT = M8_HDR + M8_HB + M8_SCB + M8_NBB;       /* 12576 */
+static constexpr int M8_NPKT = 680;
+
+void FSTEngine::run_m8_proj(int lid, bool is_down, const float* an,
+                            const uint8_t* weight,
+                            float* out_MH_N, double& t_pack, double& t_disp) {
+    const int hd = config_.hidden_dim;            /* 5120 */
+    const int inter = config_.expert_inter_dim;   /* 17408 */
+    /* up shape: N=inter,K=hd ; down shape: N=hd,K=inter */
+    const int N   = is_down ? hd    : inter;
+    const int K   = is_down ? inter : hd;
+    const int GROUPS = K / 32;
+    const int KCHUNKS = GROUPS / M8_G;            /* 10 up / 34 down */
+    const int N_TILE_USED = N / M8_NT;           /* 1088 up / 320 down */
+    const int NCHUNKS = N_TILE_USED / M8_MN;     /* 68 up / 20 down */
+    if (NCHUNKS * KCHUNKS != M8_NPKT) {
+        fprintf(stderr, "[m8-ffn] FATAL NPKT=%d != %d (shape %s)\n",
+                NCHUNKS * KCHUNKS, M8_NPKT, is_down ? "down" : "up");
+        throw std::runtime_error("m8-ffn NPKT mismatch");
+    }
+
+    if (!q35_ffn_m8_bos_ready_) {
+        q35_ffn_m8_bo_in_  = xrt::ext::bo(npu_device_, (size_t)M8_NT * M8_NPKT * M8_PKT);
+        q35_ffn_m8_bo_out_ = xrt::ext::bo(npu_device_, (size_t)M8_NT * M8_MH * M8_NTC * 4);
+        q35_ffn_m8_bos_ready_ = true;
+    }
+
+    /* ---- pack [hdr | 8 bf16 h-chunks | scales | nibbles] per packet ---- */
+    double tp0 = now();
+    uint8_t* in = q35_ffn_m8_bo_in_.map<uint8_t*>();
+    for (int t = 0; t < M8_NT; t++) {
+        for (int nc = 0; nc < NCHUNKS; nc++) {
+            for (int kc = 0; kc < KCHUNKS; kc++) {
+                const size_t pidx = (size_t)t * M8_NPKT + (nc * KCHUNKS + kc);
+                uint8_t* pkt = in + pidx * M8_PKT;
+                int row_base = nc * M8_MN, kcv = kc;
+                std::memcpy(pkt, &row_base, 4);
+                std::memcpy(pkt + 4, &kcv, 4);
+                std::memset(pkt + 8, 0, M8_HDR - 8);
+                /* 8 h-vectors, this kc's K-slice (G*32 bf16 each). */
+                for (int m = 0; m < M8_MH; m++) {
+                    const float* hm = an + (size_t)m * hd + (size_t)kc * M8_G * 32;
+                    uint8_t* dst = pkt + M8_HDR + (size_t)m * (M8_G * 32 * 2);
+                    for (int i = 0; i < M8_G * 32; i++) {
+                        bf16_t b = f2bf(hm[i]);              /* bf16 truncation */
+                        std::memcpy(dst + 2 * i, &b, 2);
+                    }
+                }
+                /* weight portion: strided 17-byte-block extraction from the
+                 * MXFP4 tensor (1 e8m0 scale + 16 nibble bytes per group). */
+                uint8_t* sc_dst = pkt + M8_HDR + M8_HB;
+                uint8_t* nb_dst = sc_dst + M8_SCB;
+                for (int r = 0; r < M8_MN; r++) {
+                    const int gn = t * N_TILE_USED + nc * M8_MN + r;
+                    const uint8_t* row = weight + (size_t)gn * GROUPS * 17;
+                    for (int g = 0; g < M8_G; g++) {
+                        const uint8_t* blk = row + (size_t)(kc * M8_G + g) * 17;
+                        sc_dst[r * M8_G + g] = blk[0];
+                        std::memcpy(nb_dst + (size_t)(r * M8_G + g) * 16, blk + 1, 16);
+                    }
+                }
+            }
+        }
+    }
+    double pack_dt = now() - tp0;
+    t_pack += pack_dt;
+    m8_ab_pack_ += pack_dt;
+
+    /* ---- dispatch ---- */
+    double td0 = now();
+    npu_sync_to(q35_ffn_m8_bo_in_);
+    std::memset(q35_ffn_m8_bo_out_.map<uint8_t*>(), 0,
+                (size_t)M8_NT * M8_MH * M8_NTC * 4);
+    npu_sync_to(q35_ffn_m8_bo_out_);
+    xrt::bo* args[2] = { &static_cast<xrt::bo&>(q35_ffn_m8_bo_in_),
+                        &static_cast<xrt::bo&>(q35_ffn_m8_bo_out_) };
+    kernel_cache_->run_registered_blob("q35_ffn_m8", args, 2).wait();
+    npu_sync_from(q35_ffn_m8_bo_out_);
+    double disp_dt = now() - td0;
+    t_disp += disp_dt;
+    m8_ab_disp_ += disp_dt;
+
+    /* ---- readback: outNpu[m][n] = outFull[t*MH*N_TILE_C + m*N_TILE_C + i], n=t*NTILE_USED+i ---- */
+    const float* outf = q35_ffn_m8_bo_out_.map<float*>();
+    for (int m = 0; m < M8_MH; m++)
+        for (int n = 0; n < N; n++) {
+            int t = n / N_TILE_USED, i = n % N_TILE_USED;
+            out_MH_N[(size_t)m * N + n] = outf[(size_t)t * M8_MH * M8_NTC
+                                              + (size_t)m * M8_NTC + i];
+        }
+}
+
+void FSTEngine::process_ffn_q35_m8_npu(int lid, const bf16_t* h8, float* out_residual) {
+    auto& w = q35_shared_[lid];
+    const int hd = config_.hidden_dim;
+    const int inter = config_.expert_inter_dim;
+    const float eps = config_.rms_eps;
+
+    /* 1. RMSNorm the 8 h-vectors -> an[8][hd] fp32 (host). */
+    std::vector<float, AlignedAllocator<float>> an((size_t)M8_MH * hd);
+    for (int m = 0; m < M8_MH; m++)
+        q35_rmsnorm(an.data() + (size_t)m * hd, h8 + (size_t)m * hd,
+                    w.ffn_norm.data(), hd, eps);
+
+    /* 2. gate + up projections (up shape, N=inter=17408). */
+    std::vector<float, AlignedAllocator<float>> g((size_t)M8_MH * inter);
+    std::vector<float, AlignedAllocator<float>> u((size_t)M8_MH * inter);
+    double tg_p = 0, tg_d = 0, tu_p = 0, tu_d = 0, td_p = 0, td_d = 0;
+    run_m8_proj(lid, false, an.data(), w.ffn_gate.data(), g.data(), tg_p, tg_d);
+    run_m8_proj(lid, false, an.data(), w.ffn_up.data(),   u.data(), tu_p, tu_d);
+
+    /* 3. silu(gate)*up (host, parallelized). */
+    std::vector<float, AlignedAllocator<float>> s((size_t)M8_MH * inter);
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < M8_MH * inter; idx++) {
+        float gv = g[idx], uv = u[idx];
+        s[idx] = gv * (1.0f / (1.0f + std::exp(-gv))) * uv;
+    }
+
+    /* 4. down projection (down shape, N=hd=5120). */
+    std::vector<float, AlignedAllocator<float>> out((size_t)M8_MH * hd, 0.0f);
+    run_m8_proj(lid, true, s.data(), w.ffn_down.data(), out.data(), td_p, td_d);
+
+    /* 5. residual (fp32). */
+    for (int m = 0; m < M8_MH; m++)
+        for (int d = 0; d < hd; d++)
+            out_residual[(size_t)m * hd + d] = bf16f(h8[(size_t)m * hd + d]) + out[(size_t)m * hd + d];
+
+    static bool first = true;
+    if (first) {
+        first = false;
+        fprintf(stderr, "[m8-ffn] L%d pack=%.1fms disp=%.1fms (gate)  pack=%.1f disp=%.1f (up)  "
+                "pack=%.1f disp=%.1f (down)\n", lid,
+                tg_p * 1e3, tg_d * 1e3, tu_p * 1e3, tu_d * 1e3, td_p * 1e3, td_d * 1e3);
+    }
+}
+
 void FSTEngine::process_ffn_hy3(int lid, bf16_t* h, int M) {
     auto& w = hy3_shared_[lid];
     const int hd = config_.hidden_dim;
@@ -4476,17 +5718,34 @@ void FSTEngine::process_ffn_hy3(int lid, bf16_t* h, int M) {
         hy3_router_host(eids.data(), wts.data(), hn.data(), w.router.data(),
                         w.router_bias.data(), M, config_.n_experts, config_.top_k,
                         hd, config_.expert_weights_scale);
-        /* Predictive prefetch (lever 1): queue this layer's experts + the next
-         * `prefetch_ahead_` layers' (Markov: same expert ids) so the SSD worker
-         * reads them while this layer's FFN runs on the NPU.  Without this,
-         * every get() is a reactive miss that blocks ~83 ms on SSD.  Unique the
-         * eids (M*top_k with dups across tokens) so the dedup scan stays small.
-         * Gated on prefetch_ahead_>=1 so FST_PREFETCH_AHEAD=0 = old baseline. */
-        if (pager_ && pager_->prefetch_ahead() >= 1) {
+        /* Expert prefetch policy (decode vs prefill differ):
+         *  - Ping-pong (FST_HY3_PINGPONG, decode M==1 only): BARRIER — wait until
+         *    this layer's experts are resident (so the FFN get()s never stall on
+         *    SSD), then issue the NEXT layer's prefetch (Markov: same eids) so
+         *    the background SSD worker reads L+1 while the NPU computes L.  The
+         *    main thread sleeps on the pager cv at the barrier — it never pread's.
+         *    Prefill (M>1) stays reactive (NPU-bound, SSD hidden by the larger
+         *    M=16 GEMMs).  Default off = the current baseline path below
+         *    (measured 0.11–0.14 tok/s depending on machine state).
+         *  - Lever 1 (FST_PREFETCH_AHEAD>=1, ping-pong off): queue this layer + the
+         *    next `prefetch_ahead_` layers (Markov); reactive get() fallback.  */
+        if (pager_) {
             std::vector<int> ueids(eids.begin(), eids.end());
             std::sort(ueids.begin(), ueids.end());
             ueids.erase(std::unique(ueids.begin(), ueids.end()), ueids.end());
-            pager_->predict_and_prefetch(lid, ueids.data(), (int)ueids.size());
+            if (pingpong_) {
+                if (M == 1) {
+                    pager_->wait_layer_loaded(lid, ueids.data(), (int)ueids.size());
+                    /* Prefetch only the next TRUNK layer (blk.0..ndec-1 = 0..79).
+                     * blk.80 is the NextN MTP head — not processed by the trunk
+                     * FFN, so prefetching it wastes SSD bandwidth.  ndec = n_layers-1. */
+                    if (lid + 1 < config_.n_layers - 1)
+                        pager_->prefetch_layer_async(lid + 1, ueids.data(), (int)ueids.size());
+                }
+                /* prefill (M>1): no prefetch queue — reactive get() per expert. */
+            } else if (pager_->prefetch_ahead() >= 1) {
+                pager_->predict_and_prefetch(lid, ueids.data(), (int)ueids.size());
+            }
         }
         process_expert_ffn_hy3(lid, hn.data(), ffn.data(), M, eids.data(), wts.data());
 
@@ -4748,6 +6007,117 @@ FSTEngine::DraftResult FSTEngine::forward_nextn_draft(const bf16_t* h_prev, int 
         for (int v = 0; v < V; v++) sum += std::exp((double)(logits[v] - mx));
         float conf = (float)(std::exp((double)(logits[draft] - mx)) / sum);
         if (k > 0 && conf < p_min) break;          /* p_min cutoff (exact rule is fork-specific) */
+        res.tokens.push_back(draft);
+        res.confidence.push_back(conf);
+        std::memcpy(h_cur.data(), h_post.data(), (size_t)hd * sizeof(bf16_t));  /* chain */
+        last_id = draft;
+    }
+    return res;
+}
+
+/* ── ARCH_QWEN35 NextN/MTP draft step (L64, kind 2).  Adapts the HY3
+ * forward_nextn_step to Q35 kernels + storage — see fst_engine.h.  Host-first,
+ * M=1, fp32 math (the MTP block is 1 layer, negligible vs the 64-layer trunk,
+ * so host compute is fine and avoids any new NPU dispatch).  The draft
+ * amortizes the 144-dispatch GDN trunk floor across K accepted tokens. */
+int FSTEngine::forward_nextn_step_q35(int last_token_id, const bf16_t* h_prev, int step,
+                                      bf16_t* h_post, float* logits) {
+    const int hd  = config_.hidden_dim;        /* 5120 */
+    const int V   = config_.vocab_size;        /* 248320 */
+    const int mtp = config_.n_layers - 1;      /* L64 */
+    auto& w = q35_shared_[mtp];
+    const float eps = config_.rms_eps;
+
+    /* 1. e = embed(last_token_id) — row-dequant one row from the raw MXFP4
+     *    embed table (same layout as generate_qwen35's embed_row). */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> e(hd);
+    {
+        const int groups = hd / 32;
+        const uint8_t* row = q35_embed_raw_.data() + (size_t)last_token_id * groups * 17;
+        for (int g = 0; g < groups; g++) {
+            const uint8_t* blk = row + (size_t)g * 17;
+            float scale = (blk[0] == 0) ? 0.0f : std::ldexp(1.0f, (int)blk[0] - 127);
+            const uint8_t* nb = blk + 1;
+            for (int i = 0; i < 32; i++) {
+                uint8_t byte = nb[i >> 1];
+                uint8_t nib = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                e[g * 32 + i] = f2bf(FP4_TABLE[nib] * scale);
+            }
+        }
+    }
+    /* 2. e_norm = rms(enorm, e); h_norm = rms(hnorm, h_prev) — F32 nextn norms. */
+    std::vector<float, AlignedAllocator<float>> e_norm(hd), h_norm(hd);
+    q35_rmsnorm_fw(e_norm.data(), e.data(),      w.nextn_enorm.data(), hd, eps);
+    q35_rmsnorm_fw(h_norm.data(), h_prev,        w.nextn_hnorm.data(), hd, eps);
+
+    /* 3. concat [e_norm; h_norm] [2*hd] → eh_proj [hd, 2*hd] → h_mtp [hd]. */
+    std::vector<float, AlignedAllocator<float>> concat((size_t)2 * hd);
+    std::memcpy(concat.data(),        e_norm.data(), (size_t)hd * sizeof(float));
+    std::memcpy(concat.data() + hd,   h_norm.data(), (size_t)hd * sizeof(float));
+    std::vector<float, AlignedAllocator<float>> hmtp(hd);
+    mxfp4_matvec_f32(hmtp.data(), concat.data(), w.nextn_eh_proj.data(), hd, 2 * hd);
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> h_mtp(hd);
+    for (int d = 0; d < hd; d++) h_mtp[d] = f2bf(hmtp[d]);
+
+    /* 4. L64 forward (own KV q35_kv_cache_[mtp]; seq_pos_=step): GQA + FFN.
+     *    process_gqa_q35 reads attn_norm (BF16, stored 1+delta via add_one) and
+     *    applies the post-attn ffn_norm inside process_ffn_q35 — same as a
+     *    trunk kind-1 layer. */
+    seq_pos_ = step;
+    process_gqa_q35(mtp, h_mtp.data(), 1);
+    process_ffn_q35(mtp, h_mtp.data(), 1);
+
+    /* 5. h_post = rms(shared_head_norm, h_mtp) — the MTP's own head norm
+     *    (mtp.norm), NOT the trunk final_norm.  Output fp32 for the lm_head
+     *    matvec; also write bf16 h_post for the next step's h_prev chaining. */
+    std::vector<float, AlignedAllocator<float>> hpost_f(hd);
+    q35_rmsnorm_fw(hpost_f.data(), h_mtp.data(), w.nextn_shared_head_norm.data(), hd, eps);
+    for (int d = 0; d < hd; d++) h_post[d] = f2bf(hpost_f[d]);
+
+    /* 6. logits = q35_lm_head_ [V,hd] (fp32) @ h_post (fp32); argmax → draft. */
+    int amx = 0; float mx = -1e30f;
+    #pragma omp parallel for schedule(static) reduction(max:mx)
+    for (int v = 0; v < V; v++) {
+        const float* row = q35_lm_head_.data() + (size_t)v * hd;
+        float s = 0.0f;
+        for (int d = 0; d < hd; d++) s += row[d] * hpost_f[d];
+        logits[v] = s;
+        if (s > mx) mx = s;
+    }
+    /* argmax (separate pass — reduction only gave the max value, not the id) */
+    amx = 0; mx = logits[0];
+    for (int v = 1; v < V; v++) if (logits[v] > mx) { mx = logits[v]; amx = v; }
+    return amx;
+}
+
+/* Iterative Q35 NextN drafting up to n_max steps with a p_min confidence cutoff.
+ * Chains h_post → h_prev across steps.  The MTP own KV (q35_kv_cache_[64]) is
+ * reset per draft session (separate from the trunk KV). */
+FSTEngine::DraftResult FSTEngine::forward_nextn_draft_q35(const bf16_t* h_prev, int last_token_id,
+                                                           int n_max, float p_min) {
+    const int hd = config_.hidden_dim;
+    const int V  = config_.vocab_size;
+    DraftResult res;
+    res.tokens.reserve(n_max);
+    res.confidence.reserve(n_max);
+
+    /* MTP own KV starts fresh for this draft session. */
+    q35_kv_cache_[config_.n_layers - 1].n = 0;
+
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> h_cur(hd), h_post(hd);
+    std::memcpy(h_cur.data(), h_prev, (size_t)hd * sizeof(bf16_t));
+    std::vector<float> logits(V);
+    int last_id = last_token_id;
+
+    for (int k = 0; k < n_max; k++) {
+        int draft = forward_nextn_step_q35(last_id, h_cur.data(), k, h_post.data(), logits.data());
+        /* confidence = softmax(logits)[draft] (greedy probability). */
+        float lmx = logits[0];
+        for (int v = 1; v < V; v++) if (logits[v] > lmx) lmx = logits[v];
+        double sum = 0.0;
+        for (int v = 0; v < V; v++) sum += std::exp((double)(logits[v] - lmx));
+        float conf = (float)(std::exp((double)(logits[draft] - lmx)) / sum);
+        if (k > 0 && conf < p_min) break;          /* p_min cutoff */
         res.tokens.push_back(draft);
         res.confidence.push_back(conf);
         std::memcpy(h_cur.data(), h_post.data(), (size_t)hd * sizeof(bf16_t));  /* chain */
@@ -7731,6 +9101,329 @@ void FSTEngine::generate_hy3(const std::vector<int>& token_ids, int mt, float /*
                     pager_->gets(), pager_->hits(), pager_->misses(), pager_->hit_rate(),
                     pager_->wait_us()/1000, pager_->wait_count(), pager_->max_wait_us(),
                     pager_->prefetched(), pager_->cache_size() >> 20);
+        if (pager_ && pager_->barrier_count() > 0)
+            fprintf(stderr, "  Ping-pong Barrier: stalls=%ldms/%ld (max=%ldus) — "
+                    "SSD read exposed on the compute path the prefetch did not hide\n",
+                    pager_->barrier_us()/1000, pager_->barrier_count(), pager_->max_barrier_us());
+        auto cs = kernel_cache_->stats();
+        fprintf(stderr, "  NPU Contexts: creates=%d evictions=%d hits=%d active=%zu\n",
+                cs.creates, cs.evictions, cs.hits, kernel_cache_->active_contexts());
+
+    } catch (const xrt::run::aie_error& e) {
+        fprintf(stderr, "\n[FATAL] XRT/AIE error: %s\n", e.what()); std::exit(1);
+    } catch (const xrt::run::command_error& e) {
+        fprintf(stderr, "\n[FATAL] XRT command error: %s\n", e.what()); std::exit(1);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "\n[FATAL] %s\n", e.what()); std::exit(1);
+    }
+}
+
+/* ── Qwen3.5-Next greedy autoregressive generation (ARCH_QWEN35) ────────────
+ * Token-by-token M=1 path (the SSM scan is recurrent; GQA causal attention
+ * over a growing KV is identical to decode at each position, so prefill reuses
+ * the same per-token loop).  Trunk = blk.0..n_layers-2 (excludes the MTP block).
+ * Each token: embed → for each trunk layer, kind 0 (process_ssm) or kind 1
+ * (process_gqa_q35), then process_ffn_q35 → output_norm → lm_head → sample.
+ * seq_pos_ advances per token (used by GQA RoPE/KV; ignored by SSM). */
+void FSTEngine::generate_qwen35(const std::vector<int>& token_ids, int mt, float temperature,
+                                 float /*top_p*/, void(*cb)(int,const char*,void*), void* u) {
+    const int N    = mt > 0 ? mt : 3;
+    const int hd   = config_.hidden_dim;
+    const int V    = config_.vocab_size;
+    const int ndec = config_.n_layers - 1;            /* trunk (excludes MTP blk) */
+    const float eps = config_.rms_eps;
+
+    /* FST_Q35_FFN_NPU: capture the first 8 trunk passes' per-layer pre-FFN h
+     * (bf16, the FFN input) + the host post-FFN residual (fp32) for an engine-
+     * level A/B (host M=1 vs NPU M=8 on the SAME 8 real hidden states).  Capture
+     * runs during the normal host decode so the 8 tokens are real model states;
+     * the A/B fires once 8 are captured.  Shipped path untouched when unset. */
+    const bool ffn_npu_gate = std::getenv("FST_Q35_FFN_NPU") != nullptr;
+    int cap_tok = 0;                                   /* trunk passes captured */
+    if (ffn_npu_gate) {
+        cap_pre_ffn_.assign((size_t)ndec * 8, std::vector<bf16_t, AlignedAllocator<bf16_t>>(hd));
+        cap_post_ffn_host_.assign((size_t)ndec * 8, std::vector<float, AlignedAllocator<float>>(hd));
+        m8_ab_pack_ = m8_ab_disp_ = 0.0;
+        fprintf(stderr, "[m8-ab] capture armed: %d layers x 8 tokens (hd=%d)\n", ndec, hd);
+    }
+
+    /* Row-dequant one embedding row [hd] from the raw MXFP4 embed table. */
+    auto embed_row = [&](int tid, bf16_t* out) {
+        const int groups = hd / 32;
+        const uint8_t* row = q35_embed_raw_.data() + (size_t)tid * groups * 17;
+        std::vector<float, AlignedAllocator<float>> f(hd);
+        for (int g = 0; g < groups; g++) {
+            const uint8_t* blk = row + (size_t)g * 17;
+            uint8_t sc = blk[0];
+            float scale = (sc == 0) ? 0.0f : std::ldexp(1.0f, (int)sc - 127);
+            const uint8_t* nb = blk + 1;
+            for (int i = 0; i < 32; i++) {
+                uint8_t byte = nb[i >> 1];
+                uint8_t nib = (i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                f[g * 32 + i] = FP4_TABLE[nib] * scale;
+            }
+        }
+        for (int d = 0; d < hd; d++) out[d] = f2bf(f[d]);
+    };
+
+    /* output_norm (F32) + fp32 lm_head argmax/sampling.  logits[v]=Σ_d W[v,d]·hn[d]. */
+    auto head_step = [&](const bf16_t* h, float* logits) -> int {
+        static int head_call = 0;
+        const bool first_head_call = (head_call == 0);
+        const char* hd_dump = std::getenv("FST_HEAD_DUMP");
+        std::vector<float, AlignedAllocator<float>> hn(hd);
+        for (int d = 0; d < hd; d++) hn[d] = bf16f(h[d]);
+        float ss = 0.0f; for (int d = 0; d < hd; d++) ss += hn[d] * hn[d];
+        float rcp = 1.0f / std::sqrt(ss / (float)hd + eps);
+        if (hd_dump) {
+            static bool fnr = false;
+            if (!fnr) {
+                fprintf(stderr, "[head] q35_final_norm_ size=%zu  [0:4]=", q35_final_norm_.size());
+                for (int d = 0; d < 4; d++)
+                    fprintf(stderr, "%.4f ", (q35_final_norm_.size() > (size_t)d) ? q35_final_norm_[d] : -999.0f);
+                float fnn = 0.0f, fnmx = -1e30f, fnmn = 1e30f;
+                for (size_t d = 0; d < q35_final_norm_.size(); d++) { float v = q35_final_norm_[d]; fnn += v; if (v > fnmx) fnmx = v; if (v < fnmn) fnmn = v; }
+                fprintf(stderr, " mean=%.4f mn=%.4f mx=%.4f\n", q35_final_norm_.size() ? fnn / q35_final_norm_.size() : 0.0f, fnmn, fnmx);
+                fnr = true;
+            }
+            fprintf(stderr, "[head] call %d pos=%d |h|^2/hd=%.6f rcp=%.6f h[0:4]=", head_call, seq_pos_, ss / (float)hd, rcp);
+            for (int d = 0; d < 4; d++) fprintf(stderr, "%.4f ", hn[d]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+        for (int d = 0; d < hd; d++) hn[d] = hn[d] * rcp * q35_final_norm_[d];
+        #pragma omp parallel for schedule(static)
+        for (int v = 0; v < V; v++) {
+            const float* row = q35_lm_head_.data() + (size_t)v * hd;
+            float s = 0.0f;
+            for (int d = 0; d < hd; d++) s += row[d] * hn[d];
+            logits[v] = s;
+        }
+        if (hd_dump) {
+            std::vector<std::pair<float,int>> tl(V);
+            for (int v = 0; v < V; v++) tl[v] = {logits[v], v};
+            std::partial_sort(tl.begin(), tl.begin() + 8, tl.end(),
+                              [](const std::pair<float,int>& a, const std::pair<float,int>& b){ return a.first > b.first; });
+            fprintf(stderr, "[head] call %d top8: ", head_call);
+            for (int i = 0; i < 8; i++) fprintf(stderr, "(%d:%.3f) ", tl[i].second, tl[i].first);
+            float lmn = 1e30f, lmx = -1e30f, ls = 0.0f;
+            for (int v = 0; v < V; v++) { ls += logits[v]; if (logits[v] > lmx) lmx = logits[v]; if (logits[v] < lmn) lmn = logits[v]; }
+            fprintf(stderr, " | logits mn=%.3f mx=%.3f mean=%.4f\n", lmn, lmx, ls / V);
+            fflush(stderr);
+            head_call++;
+        }
+        /* FST_HEAD_DUMP: at pos 0 only, dump the full pre-norm hidden state h,
+         * the post-norm hn, and the full logit vector — so the numpy/HF ref can
+         * do an end-to-end trunk+final_norm+lm_head comparison (the block-level
+         * bit-correctness checks never verified the COMPOSITION). */
+        if (hd_dump && first_head_call) {
+            std::vector<float> hf(hd);
+            for (int d = 0; d < hd; d++) hf[d] = bf16f(h[d]);
+            std::ofstream(std::string(hd_dump) + "/head_p0_h_prenorm.f32")
+                .write((const char*)hf.data(), hd * sizeof(float));
+            std::ofstream(std::string(hd_dump) + "/head_p0_hn.f32")
+                .write((const char*)hn.data(), hd * sizeof(float));
+            std::ofstream(std::string(hd_dump) + "/head_p0_logits.f32")
+                .write((const char*)logits, (size_t)V * sizeof(float));
+            fprintf(stderr, "[head] dumped p0 h_prenorm(%d) + hn(%d) + logits(%d) to %s\n",
+                    hd, hd, V, hd_dump); fflush(stderr);
+        }
+        return sample_token(logits, V, temperature, 0.9f);
+    };
+
+    auto run_trunk_token = [&](bf16_t* h) {
+        const char* td = std::getenv("FST_TRUNK_DUMP");
+        const bool tt = std::getenv("FST_TRUNK_TIME") != nullptr;
+        const bool cap = (ffn_npu_gate && cap_tok < 8);   /* capture this pass? */
+        double tS=0, tG=0, tF=0;
+        for (int l = 0; l < ndec; l++) {
+            int kind = (l < (int)config_.layer_types.size()) ? config_.layer_types[l] : (l % config_.full_attn_interval == config_.full_attn_interval - 1 ? 1 : 0);
+            double s0 = tt ? now() : 0;
+            if (kind == 0) process_ssm(l, h, 1);
+            else          process_gqa_q35(l, h, 1);
+            if (tt) { double e=now(); (kind==0?tS:tG)+=e-s0; s0=e; }
+            if (cap) std::memcpy(cap_pre_ffn_[(size_t)l * 8 + cap_tok].data(), h, (size_t)hd * sizeof(bf16_t));
+            process_ffn_q35(l, h, 1);
+            if (cap) { float* dst = cap_post_ffn_host_[(size_t)l * 8 + cap_tok].data();
+                       for (int d = 0; d < hd; d++) dst[d] = bf16f(h[d]); }
+            if (tt) tF += now() - s0;
+            if (td && seq_pos_ == (int)token_ids.size() - 1) {
+                std::vector<float> hf(hd);
+                for (int d = 0; d < hd; d++) hf[d] = bf16f(h[d]);
+                std::ofstream(std::string(td) + "/eng_h_L" + std::to_string(l) + ".f32")
+                    .write((const char*)hf.data(), hd * sizeof(float));
+            }
+        }
+        if (tt) fprintf(stderr, "[trunk-time] ssm=%.0fms gqa=%.0fms ffn=%.0fms (pos=%d)\n",
+                        tS*1000, tG*1000, tF*1000, seq_pos_);
+        if (cap) cap_tok++;
+    };
+
+    /* ── M=8 NPU FFN A/B (fires once 8 trunk passes are captured) ──────────────
+     * For each trunk layer: take the 8 captured pre-FFN h's, run the host M=1 FFN
+     * 8x (re-timed, same-input reference) AND the M=8 NPU FFN (1 dispatch/proj),
+     * compare the post-FFN residual per (layer,token).  Then a last-layer greedy
+     * argmax (final_norm + lm_head) on host vs NPU residuals = the token check.
+     * Reports host 8x vs NPU M=8 totals incl. the packing fraction. */
+    auto run_ab = [&]() {
+        fprintf(stderr, "\n[m8-ab] === host M=1 (8x) vs NPU M=8 FFN: 8 tokens x %d layers ===\n", ndec);
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> h8((size_t)8 * hd);
+        std::vector<float, AlignedAllocator<float>> host_res((size_t)8 * hd);
+        std::vector<float, AlignedAllocator<float>> npu_res((size_t)8 * hd);
+        std::vector<float, AlignedAllocator<float>> last_npu;   /* last-layer NPU residuals */
+        double host_total = 0.0;
+        m8_ab_pack_ = m8_ab_disp_ = 0.0;
+        double max_rel = 0.0, sum_rel = 0.0; int n_cmp = 0, n_fail = 0;
+
+        for (int l = 0; l < ndec; l++) {
+            for (int t = 0; t < 8; t++)
+                std::memcpy(h8.data() + (size_t)t * hd, cap_pre_ffn_[(size_t)l * 8 + t].data(),
+                            (size_t)hd * sizeof(bf16_t));
+            /* host 8x (re-time on the same captured inputs). */
+            double th0 = now();
+            for (int t = 0; t < 8; t++) {
+                std::vector<bf16_t, AlignedAllocator<bf16_t>> hc(h8.begin() + (size_t)t * hd,
+                                                                 h8.begin() + (size_t)t * hd + hd);
+                process_ffn_q35(l, hc.data(), 1);          /* modifies hc in place */
+                for (int d = 0; d < hd; d++) host_res[(size_t)t * hd + d] = bf16f(hc[d]);
+            }
+            host_total += now() - th0;
+            /* NPU M=8 (one dispatch per projection, 8 tokens at once). */
+            process_ffn_q35_m8_npu(l, h8.data(), npu_res.data());
+            if (l == ndec - 1) last_npu = npu_res;
+            /* per-(layer,token) residual rel-error vs host. */
+            for (int t = 0; t < 8; t++) {
+                double mx = 0.0, refmx = 0.0;
+                for (int d = 0; d < hd; d++) {
+                    /* bf16-fair: truncate NPU fp32 residual to bf16 (the trunk
+                       carries bf16 residuals, so this is apples-to-apples vs
+                       host_res which is already a bf16 value). */
+                    double nv = (double)bf16f(f2bf(npu_res[(size_t)t * hd + d]));
+                    double dd = std::fabs(nv - (double)host_res[(size_t)t * hd + d]);
+                    if (dd > mx) mx = dd;
+                    double ar = std::fabs((double)host_res[(size_t)t * hd + d]);
+                    if (ar > refmx) refmx = ar;
+                }
+                double rel = refmx > 0 ? mx / refmx : mx;
+                max_rel = std::max(max_rel, rel); sum_rel += rel; n_cmp++;
+                if (rel > 5e-3) n_fail++;
+            }
+            if ((l % 16) == 0) fprintf(stderr, "[m8-ab] L%d done\n", l);
+        }
+
+        /* last-layer greedy argmax: host (captured residual) vs NPU. */
+        auto argmax_res = [&](const float* r) -> int {
+            std::vector<float, AlignedAllocator<float>> hn(hd);
+            float ss = 0.0f;
+            for (int d = 0; d < hd; d++) { float x = bf16f(f2bf(r[d])); hn[d] = x; ss += x * x; }
+            float rcp = 1.0f / std::sqrt(ss / (float)hd + eps);
+            for (int d = 0; d < hd; d++) hn[d] = hn[d] * rcp * q35_final_norm_[d];
+            std::vector<float> lg(V);
+            #pragma omp parallel for schedule(static)
+            for (int v = 0; v < V; v++) { float s = 0.0f;
+                for (int d = 0; d < hd; d++) s += q35_lm_head_[(size_t)v * hd + d] * hn[d]; lg[v] = s; }
+            int am = 0; float mx = lg[0];
+            for (int v = 1; v < V; v++) if (lg[v] > mx) { mx = lg[v]; am = v; }
+            return am;
+        };
+        int arg_match = 0;
+        for (int t = 0; t < 8; t++) {
+            int ht = argmax_res(cap_post_ffn_host_[(size_t)(ndec - 1) * 8 + t].data());
+            int nt = argmax_res(last_npu.data() + (size_t)t * hd);
+            if (ht == nt) arg_match++;
+            fprintf(stderr, "[m8-ab] tok %d: host_pred=%d npu_pred=%d %s\n",
+                    t, ht, nt, ht == nt ? "MATCH" : "DIFF");
+        }
+
+        double npu_total = m8_ab_pack_ + m8_ab_disp_;
+        fprintf(stderr, "\n[m8-ab] === RESULT ===\n");
+        fprintf(stderr, "[m8-ab] host M=1 8x FFN : %.2f s (%.2f ms/layer)\n",
+                host_total, host_total * 1e3 / ndec);
+        fprintf(stderr, "[m8-ab] NPU M=8 FFN     : %.2f s  (pack %.2f s + dispatch %.2f s)\n",
+                npu_total, m8_ab_pack_, m8_ab_disp_);
+        fprintf(stderr, "[m8-ab] packing fraction: %.0f%% of NPU time\n",
+                npu_total > 0 ? 100.0 * m8_ab_pack_ / npu_total : 0.0);
+        fprintf(stderr, "[m8-ab] speedup (host/npu): %.2fx   per-8tok save: %.2f s\n",
+                npu_total > 0 ? host_total / npu_total : 0.0, host_total - npu_total);
+        fprintf(stderr, "[m8-ab] residual rel-err: max=%.3e mean=%.3e  (%d/%d layers>5e-3)\n",
+                max_rel, sum_rel / std::max(1, n_cmp), n_fail, n_cmp);
+        fprintf(stderr, "[m8-ab] last-layer argmax: %d/8 match\n", arg_match);
+        fprintf(stderr, "[m8-ab] target: host 8x ~16.4s, npu dispatch ~9.3s; win iff npu_total<host_total\n");
+    };
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto t1 = t0;
+    try {
+        /* Fresh recurrent state for this generation: zero every SSM layer's
+         * matrix state S + conv1d buffer, and reset the GQA KV row counts. */
+        for (int l = 0; l < ndec; l++) {
+            auto& st = q35_ssm_state_[l];
+            std::fill(st.S.begin(), st.S.end(), 0.0f);
+            std::fill(st.conv.begin(), st.conv.end(), 0.0f);
+            q35_kv_cache_[l].n = 0;
+        }
+        is_prefill_ = true;
+        std::vector<bf16_t, AlignedAllocator<bf16_t>> h(hd);
+        std::vector<float> logits(V);
+        int tid = -1;
+
+        /* 1. prefill: one token at a time through the trunk. */
+        for (int t = 0; t < (int)token_ids.size(); t++) {
+            seq_pos_ = t;
+            auto te0 = std::chrono::steady_clock::now();
+            embed_row(token_ids[t], h.data());
+            run_trunk_token(h.data());
+            if ((t % 4) == 0 || t + 1 == (int)token_ids.size()) {
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te0).count();
+                fprintf(stderr, "[q35-gen] prefill tok %d/%zu id=%d (%.1f ms)\n",
+                        t + 1, token_ids.size(), token_ids[t], ms); fflush(stderr);
+            }
+        }
+        seq_pos_ = (int)token_ids.size();
+        tid = head_step(h.data(), logits.data());
+        fprintf(stderr, "[q35-gen] prefill-last=%d (M=%d)\n", tid, (int)token_ids.size()); fflush(stderr);
+        if (cb) cb(tid, "", u);
+        is_prefill_ = false;
+        t1 = std::chrono::steady_clock::now();
+        double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        int tokens_generated = 1;
+
+        /* FST_Q35_FFN_NPU: if 8 trunk passes already captured (prompt >= 8), run
+         * the M=8 A/B now and return — skip the (slow) decode loop.  Short prompts
+         * fall through to decode, which captures the rest; the A/B then fires below. */
+        if (ffn_npu_gate && cap_tok >= 8) {
+            run_ab();
+            return;
+        }
+
+        /* 2. decode loop. */
+        for (int tok = 1; tok < N; tok++) {
+            seq_pos_ = (int)token_ids.size() + tok - 1;   /* abs position of this new token */
+            auto td0 = std::chrono::steady_clock::now();
+            embed_row(tid, h.data());
+            run_trunk_token(h.data());
+            double trunk_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+            fprintf(stderr, "[q35-gen] decode tok %d trunk done (%.0fms), head_step...\n", tok, trunk_ms); fflush(stderr);
+            auto th0 = std::chrono::steady_clock::now();
+            tid = head_step(h.data(), logits.data());
+            double head_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - th0).count();
+            fprintf(stderr, "[q35-gen] decode=%d (pos=%d trunk=%.0fms head=%.0fms)\n", tid, seq_pos_, trunk_ms, head_ms); fflush(stderr);
+            fprintf(stderr, "[q35-gen] decode=%d (pos=%d trunk=%.0fms)\n", tid, seq_pos_, trunk_ms); fflush(stderr);
+            if (cb) cb(tid, "", u);
+            tokens_generated++;
+            if (seq_pos_ >= config_.max_seq - 1) break;
+        }
+
+        /* FST_Q35_FFN_NPU fallback: short prompt => capture finished during decode. */
+        if (ffn_npu_gate && cap_tok >= 8) { run_ab(); return; }
+
+        auto t2 = std::chrono::steady_clock::now();
+        double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        double tps = (tokens_generated > 1) ? (double)(tokens_generated - 1) / (decode_ms / 1000.0) : 0.0;
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        fprintf(stderr, "\n  Q35 Prefill: %.1f ms (%d prompt tokens, %d trunk layers)\n",
+                prefill_ms, (int)token_ids.size(), ndec);
+        fprintf(stderr, "  Q35 Decode Tokens/sec: %.2f\n", tps);
+        fprintf(stderr, "  Peak RAM (RSS): %.1f GB\n", (double)ru.ru_maxrss / 1048576.0);
         auto cs = kernel_cache_->stats();
         fprintf(stderr, "  NPU Contexts: creates=%d evictions=%d hits=%d active=%zu\n",
                 cs.creates, cs.evictions, cs.hits, kernel_cache_->active_contexts());
@@ -7748,6 +9441,10 @@ void FSTEngine::generate(const std::vector<int>& token_ids, int mt, float temper
                          void(*cb)(int,const char*,void*), void* u) {
     if (config_.arch == ARCH_HY3) {                 /* HY3 has its own host-first path */
         generate_hy3(token_ids, mt, temperature, top_p, cb, u);
+        return;
+    }
+    if (config_.arch == ARCH_QWEN35) {              /* Qwen3.5-Next hybrid SSM/GQA */
+        generate_qwen35(token_ids, mt, temperature, top_p, cb, u);
         return;
     }
     int N = mt > 0 ? mt : 3;

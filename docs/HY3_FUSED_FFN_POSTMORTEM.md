@@ -354,3 +354,98 @@ wrong by ~4× (it assumed attention = 30 ms; real 105 ms).
    neutral above. **Do not chase for tok/s.**
 4. Task #22 NPU gateup-silu fusion — dispatch-count aesthetics only (marginal
    tok/s; the 37 ms NPU FFN is already a minority share).
+
+## Ping-pong double-buffer measurement — overlap SSD with NPU compute (2026-07-10)
+
+User directive: **"implement Modern Double Buffering (Ping-Pong) to overlap SSD
+I/O with NPU Compute. The SSD must read Layer L+1 while the NPU computes Layer
+L."** Rules: ZERO synchronous `pread` in the main thread; the NPU must never
+stall on SSD; use a background `std::thread` + `pread` (the existing worker) or
+`aio_read`. Implemented + env-gated (`FST_HY3_PINGPONG`, default OFF = current
+path) + A/B-measured. **Result: NEUTRAL — does not break the 0.11 ceiling.**
+
+### What shipped (env-gated, additive, DS4 byte-identical)
+- **`ExpertPager::wait_layer_loaded(L, eids, n)` — the BARRIER**
+  (`expert_pager.cpp`). Blocks until every `(L, eids[i])` is resident in the LRU.
+  Queues any that are neither cached nor in-flight, then sleeps on
+  `loading_cv_` (no `pread` in the main thread — the worker reads). Re-queues
+  missing experts on each pass with a 100 ms timed wait, so an expert evicted
+  after load can't deadlock the barrier. After it returns, the FFN's `get()`s
+  are guaranteed instant cache hits → **zero SSD stall on the compute path**.
+- **`ExpertPager::prefetch_layer_async(L+1, eids, n)`** — pure enqueue (wraps
+  `prefetch()`, which dedups). Issued right after the barrier so the worker
+  reads L+1 during L's NPU FFN (Markov: `eids_{L+1} ≈ eids_L`).
+- **Engine wiring** (`fst_engine.cpp`, `process_ffn_hy3` MoE branch, decode
+  `M==1` only): `wait_layer_loaded(L)` → `prefetch_layer_async(L+1)` →
+  `process_expert_ffn_hy3_fused` (whose `get()`s now fast-hit). Prefill (`M>1`)
+  stays reactive (NPU-bound, SSD hidden by the larger M=16 GEMMs). Guard
+  `lid+1 < n_layers-1` so the NextN MTP head (blk.80) is never prefetched (it
+  isn't in the trunk FFN loop). `pingpong_` member set in the ctor from
+  `FST_HY3_PINGPONG` (presence = on, matching `FST_HY3_FUSED_FFN`).
+- **Instrumentation:** `stat_barrier_us_`/`barrier_count_`/`max_barrier_us_` +
+  a `Ping-pong Barrier: stalls=…` line in the HY3 stats print — the real "did
+  the SSD stall the compute path?" signal (analogous to `get()` `wait`).
+
+### A/B (clean, same robust binary, back-to-back; raw M=1 "Hi" --tokens 6 --temp 0)
+
+| config | tok/s | SSD stall lives in | total stall | max stall | misses | prefetched |
+|--------|-------|--------------------|-------------|-----------|--------|------------|
+| **Baseline** (AHEAD=0, ping-pong off) | **0.11** | `get()` `wait` | 24264 ms / 3758 | 20.5 ms | 3758 | 0 |
+| **Ping-pong ON** (robust barrier, fixed guard) | **0.11** | barrier | 22670 ms / 474 | **1443 ms** | **0** | 3711 |
+| Ping-pong ON (simple barrier, first build) | 0.10 | barrier | 29168 ms / 474 | 1979 ms | 0 | 3711 |
+
+`gets=3792`, `hit_rate=1.000`, `cache=5995 MB`, `RSS=25.5 GB`, `5 NPU ctx` every
+row. Output **"KK" = 58933 ×5 preserved** (ping-pong is timing-only — same experts,
+same math; verified empirically). Templated coherence gate verified separately
+(`run_pp_on_coh.log`).
+
+### What the barrier proved (the win inside the neutral result)
+- **The FFN compute path is now stall-free.** `wait=0 ms / 0`, `misses=0` (vs
+  baseline 24.3 s / 3758) — every `get()` is an instant cache hit because the
+  barrier pre-loaded the layer's experts. The SSD cost moved entirely out of
+  `get()` and into the barrier, exactly as designed. **This is the
+  infrastructure any future SSD-speed or exact-prediction win needs.**
+- **Total SSD stall dropped 7%** (22670 vs 24264 ms): the L+1 read overlaps L's
+  NPU FFN, so some SSD is hidden. Real, but below the 0.11 rounding bucket.
+- **Robust > simple barrier**: 47.9 ms avg / 1.44 s max (robust) vs 61 ms /
+  1.98 s (simple). The re-queue-on-eviction + 100 ms timed wait + MTP guard
+  cut both the average and the worst-case flood spike.
+
+### Why it can't break the ceiling (the physics)
+1. **SSD read > compute window.** 8 experts × 10 MB ÷ ~1.6 GB/s ≈ **52 ms** to
+   read a layer's experts. The compute window that can overlap with reading
+   L+1 = L's NPU FFN (37 ms) + L+1 host attn (7 ms) + L+1 router (~1 ms) ≈
+   **45 ms**. Since **52 > 45**, the single serial SSD worker **cannot outpace
+   compute even with perfect prediction** — a ~7 ms/layer excess is always
+   exposed. Perfect-prefetch ceiling ≈ (37+7+7) ms ≈ 51 ms/L ≈ **0.18–0.20
+   tok/s**. Ping-pong overlap only helps when SSD < compute; here SSD > compute,
+   so SSD is the binding bottleneck regardless of *when* it reads.
+2. **Markov (~80%) floods the worker.** `prefetch_layer_async(L+1, eids_L)`
+   loads L+1's *predicted* experts; the ~20% that don't match `eids_{L+1}` are
+   wasted reads that consume the worker's bandwidth. With ~9.6 reads/layer (8
+   used + ~1.6 waste) vs a 45 ms window, the worker falls behind → the barrier
+   waits behind a backlog (max stall **1.44 s**). The baseline wastes nothing
+   (0% waste, pure reactive) so it ties despite exposing SSD serially.
+3. **The 0.11 baseline is near-optimal** for this SSD+compute balance: SSD
+   exposed serially, zero wasted bandwidth. Ping-pong matches it (neutral) by
+   trading "serial SSD, 0% waste" for "overlapped SSD, 20% waste + barrier
+   overhead" — a wash.
+
+### The honest verdict + decision
+**Ping-pong is NEUTRAL (0.11 vs 0.11); it does NOT break the ceiling**, for the
+same root cause as the levers-1+3 net-negative finding (SSD bandwidth-bound,
+worker serial, prediction imperfect). The barrier is correct, robust, and
+useful infrastructure (it proves the FFN can be made stall-free and isolates the
+SSD cost to a measurable barrier), but it is **kept env-gated, default OFF**
+(`FST_HY3_PINGPONG` unset = the 0.11 path). Not shipped as default.
+
+**The only levers that can beat 0.11** (none are ping-pong):
+- **Faster SSD** — read 8 experts in < 45 ms (hardware; would let ping-pong
+  reach ~0.18).
+- **Smaller experts** — more quantization (< 10 MB/expert) → faster reads →
+  SSD < compute (quality trade-off).
+- **Near-exact next-layer prediction** — draft-driven `predict_and_prefetch_from_draft`
+  (cuts the 20% waste), but SSD > compute still caps it at ~0.18 and the draft
+  router costs compute. Complex, uncertain.
+The decode floor (~89–114 ms/L depending on machine state) is SSD-bound; the
+host attention that *was* the floor is already optimized (OpenMP+SIMD, 105→7 ms).

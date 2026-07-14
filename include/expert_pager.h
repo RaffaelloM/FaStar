@@ -81,6 +81,20 @@ public:
      *  are also queued (cheap if already loading).                    */
     void predict_and_prefetch(int cur_layer, const int* eids, int n);
 
+    /*  Ping-pong double-buffer prefetch (decode overlap): the engine calls
+     *  wait_layer_loaded(L) as a BARRIER at the start of layer L — it blocks
+     *  until every expert (L, eids[i]) is resident, queueing any that are
+     *  neither cached nor loading first.  The main inference thread never
+     *  pread's: it sleeps on loading_cv_ while the background SSD worker reads.
+     *  Once the barrier returns, the FFN's get()s are guaranteed instant cache
+     *  hits (no SSD stall on the compute path).  Call prefetch_layer_async(L+1)
+     *  right after the barrier (Markov: eids_{L+1} ~= eids_L) so the worker
+     *  reads L+1's experts from SSD while the NPU computes L — overlapping I/O
+     *  with compute.  This is the "expert virtual memory" double-buffer: L is
+     *  the read-side buffer, L+1 is the write-side buffer the worker fills.   */
+    void prefetch_layer_async(int layer_id, const int* eids, int n);
+    void wait_layer_loaded(int layer_id, const int* eids, int n);
+
     /*  Draft-driven prefetch (DSpark): before the main model verification
      *  pass, the draft model has already generated gamma candidate tokens.
      *  This method runs the layer's router (CPU) on the draft token
@@ -140,6 +154,14 @@ public:
     long wait_us()    const { return stat_wait_us_.load(); }
     long wait_count() const { return stat_wait_count_.load(); }
     long max_wait_us()const { return stat_max_wait_us_.load(); }
+    /* Ping-pong barrier accounting: time the main thread spent BLOCKED inside
+     * wait_layer_loaded() — i.e. SSD read exposed on the compute path that the
+     * prefetch did NOT manage to hide.  If this stays near zero, ping-pong is
+     * fully overlapping I/O with NPU compute; if it grows, the worker can't
+     * keep up (compute < SSD) or Markov misses forced reactive loads.        */
+    long barrier_us()    const { return stat_barrier_us_.load(); }
+    long barrier_count() const { return stat_barrier_count_.load(); }
+    long max_barrier_us()const { return stat_max_barrier_us_.load(); }
     int  prefetch_ahead() const { return prefetch_ahead_; }
     double hit_rate() const {
         long g = stat_gets_.load();
@@ -201,6 +223,9 @@ private:
     std::atomic<long> stat_wait_us_{0};      /* total us spent in get() slow path */
     std::atomic<long> stat_wait_count_{0};   /* # of gets that took the slow path */
     std::atomic<long> stat_max_wait_us_{0};  /* worst single get() wait (us) */
+    std::atomic<long> stat_barrier_us_{0};     /* us blocked in wait_layer_loaded */
+    std::atomic<long> stat_barrier_count_{0};  /* # of wait_layer_loaded calls */
+    std::atomic<long> stat_max_barrier_us_{0}; /* worst single barrier wait (us) */
 
     /* ── Draft-driven prefetch: router weights for CPU routing ──── */
     /*  Non-owning pointers — caller (FSTEngine) keeps data alive.    */

@@ -14,6 +14,9 @@ __pycache__/
 *.fst.*
 *.gguf
 *.gguf.*
+*.safetensors
+*.safetensors.*
+models/
 tokenizer.json
 main_*.bin
 
@@ -34,6 +37,10 @@ tools/gen_insts
 tools/mc_gemm_probe
 tools/parse_insts
 tools/wqb_pack_probe
+# QWopus/GDN probe binaries (no extension); their tools/*.cpp sources are tracked
+tools/gdn_*
+tools/qwopus_*
+!tools/*.cpp
 fst_xclbin_inspect
 fst_npu_executor
 fst_gemm_probe

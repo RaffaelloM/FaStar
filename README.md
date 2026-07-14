@@ -18,7 +18,7 @@ budget via a paged expert cache.
 > 🆕 **Now also runs Tencent Hunyuan-3.0 (HY3)** — a 299B GQA + sigmoid-router + NextN-MTP
 > Mixture-of-Experts (~17B active), the opposite attention family from DeepSeek V4 Flash's MLA.
 > Decode is now **~0.14 tok/s** (OpenMP + AVX2/FMA-SIMD host attention). See the
-> [HY3 section](#hunyuan-30-hy3) below and the [HY3 model card](HY3_MODEL_CARD.md).
+> [HY3 section](#hunyuan-30-hy3) below and the [HY3 model card](docs/HY3_MODEL_CARD.md).
 
 ---
 
@@ -71,7 +71,7 @@ xclbins (only the expert block size differs, read from the header) and **drops `
 
 ```bash
 export XILINX_XRT=/usr
-# hy3.fst + tokenizer.json come from the HY3 HuggingFace repo (see HY3_MODEL_CARD.md)
+# hy3.fst + tokenizer.json come from the HY3 HuggingFace repo (see docs/HY3_MODEL_CARD.md)
 ./build/ds4_npu_engine --model hy3.fst --prompt "Hello" --tokens 32 --temp 0.0
 #   -> "Hello! How can I help you today ..."
 ```
@@ -103,13 +103,13 @@ longer the floor and SSD expert loading is back to the largest share.
 The converted `hy3.fst` (173.82 GB) + `tokenizer.json` are self-contained — unlike the
 DeepSeek-V4-Flash-DSpark set, HY3 needs **no sidecar files** (its GQA + sigmoid router use
 no MLA/HC or hash-routing sidecars; RMSNorm weights live in the `.fst` shared bank). See
-**[HY3_MODEL_CARD.md](HY3_MODEL_CARD.md)** for the HuggingFace model card (Apache-2.0,
+**[HY3_MODEL_CARD.md](docs/HY3_MODEL_CARD.md)** for the HuggingFace model card (Apache-2.0,
 inherited from `tencent/Hy3` via the `satgeze/Hy3-1M-GGUF` Q3_K_M source). Conversion is
 reproducible: `scripts/hy3_download.py` → `scripts/fst_converter.py hy3` → `scripts/verify_fst.py`.
 
 Full build notes (the converter, the HY3 engine path, the fused-FFN dispatch collapse,
-and the levers-1+3 / OpenMP / SIMD measurements) are in `HY3_PLAN.md`,
-`HY3_PIVOT_POSTMORTEM.md`, and `HY3_FUSED_FFN_POSTMORTEM.md`.
+and the levers-1+3 / OpenMP / SIMD measurements) are in `docs/HY3_PLAN.md`,
+`docs/HY3_PIVOT_POSTMORTEM.md`, and `docs/HY3_FUSED_FFN_POSTMORTEM.md`.
 
 ---
 

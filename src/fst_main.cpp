@@ -788,7 +788,7 @@ int main(int argc, char** argv) {
      * token (80×8=640), giving zero cross-token reuse.  FST_RAM_CACHE_GB raises
      * it (e.g. 20 GB ≈ 2000 experts ≈ 3 tokens) to capture cross-token reuse;
      * the fused path has no 2x BO duplication, so RSS stays ~40 GB on a 60 GB
-     * box.  60 GB RAM, ~55 GB available — see HY3_FUSED_FFN_POSTMORTEM. */
+     * box.  60 GB RAM, ~55 GB available — see docs/HY3_FUSED_FFN_POSTMORTEM.md. */
     size_t ram_mb = 6000;
     if (const char *e = std::getenv("FST_RAM_CACHE_GB"))
         ram_mb = (size_t)std::strtoul(e, nullptr, 10) * 1024ULL;
@@ -843,20 +843,44 @@ int main(int argc, char** argv) {
      * special tokens as their single IDs.  DeepSeek stays on its own template
      * (its special tokens are NOT in the HY3 vocab and vice-versa). */
     const bool hy3_raw = (engine.config_.arch == ARCH_HY3) && std::getenv("FST_HY3_RAW_PROMPT");
-    const std::string chat_prompt =
-        (engine.config_.arch == ARCH_HY3)
-        ? (hy3_raw ? args.prompt
-           : (std::string("<｜hy_begin_of_sentence:opensource｜>") +
-              std::string("<｜reasoning_mode:opensource｜>reasoning_effort:no_think") +
-              std::string("<｜hy_User:opensource｜>") + args.prompt +
-              std::string("<｜hy_Assistant:opensource｜>") +
-              std::string("<think:opensource></think:opensource>")))
-        : std::string("<｜begin▁of▁sentence｜><｜User｜>") + args.prompt +
-        std::string("<｜Assistant｜>\n");
-    fprintf(stderr, "  [chat-template] %s (%zu bytes)\n",
-            hy3_raw ? "RAW HY3 prompt (test bypass)"
-                    : (engine.config_.arch == ARCH_HY3 ? "templated HY3 prompt" : "wrapped DS4 prompt"),
-            chat_prompt.size());
+    const bool q35_raw = (engine.config_.arch == ARCH_QWEN35) && std::getenv("FST_Q35_RAW_PROMPT");
+    std::string chat_prompt;
+    const char* tmpl_desc = "wrapped DS4 prompt";
+    if (engine.config_.arch == ARCH_HY3) {
+        tmpl_desc = hy3_raw ? "RAW HY3 prompt (test bypass)" : "templated HY3 prompt";
+        chat_prompt = hy3_raw ? args.prompt
+            : (std::string("<｜hy_begin_of_sentence:opensource｜>") +
+               std::string("<｜reasoning_mode:opensource｜>reasoning_effort:no_think") +
+               std::string("<｜hy_User:opensource｜>") + args.prompt +
+               std::string("<｜hy_Assistant:opensource｜>") +
+               std::string("<think:opensource></think:opensource>"));
+        } else if (engine.config_.arch == ARCH_QWEN35) {
+        /* Qwen3.5-Next ChatML.  THINKING MODE ON by default: the prompt ends
+         * at "<|im_start|>assistant\n" and the model emits its own
+         *  малую ...  малую reasoning before the answer.  The no_think empty
+         * block ("малую\n\nмалую\n\n", the GGUF chat_template
+         * enable_thinking=false branch) is opt-in via FST_Q35_NO_THINK=1 —
+         * forcing it on this 4-bit-quantized reasoning model collapses it
+         * into a deterministic 248069/271 (малую / "\n\n") 2-cycle
+         * (proven genuine model behavior, not an engine bug; the engine is
+         * bit-correct end-to-end vs an independent numpy ref).  The HF
+         * bridge recognises <|im_start|>/<|im_end|> as single special tokens. */
+        tmpl_desc = q35_raw ? "RAW Q35 prompt (test bypass)" : "templated Qwen3 ChatML prompt";
+        if (q35_raw) {
+            chat_prompt = args.prompt;
+        } else {
+            chat_prompt = std::string("<|im_start|>user\n") + args.prompt +
+                           std::string("<|im_end|>\n<|im_start|>assistant\n");
+            if (std::getenv("FST_Q35_NO_THINK")) {
+                chat_prompt += std::string("малую\n\nмалую\n\n");
+                tmpl_desc = "templated Qwen3 ChatML prompt (no_think)";
+            }
+        }
+} else {
+        chat_prompt = std::string("<｜begin▁of▁sentence｜><｜User｜>") + args.prompt +
+                      std::string("<｜Assistant｜>\n");
+    }
+    fprintf(stderr, "  [chat-template] %s (%zu bytes)\n", tmpl_desc, chat_prompt.size());
 
     /* Encode via the HF tokenizers bridge (correct ByteLevel BPE).  Fall back
      * to the (lossy) C++ encoder only if the bridge is unavailable. */

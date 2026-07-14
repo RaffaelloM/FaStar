@@ -361,6 +361,94 @@ void ExpertPager::predict_and_prefetch(int cur_layer, const int* eids, int n)
     }
 }
 
+/* ── Ping-pong double-buffer prefetch ─────────────────────────────────── */
+/*  prefetch_layer_async: issue the next layer's expert reads in the
+ *  background.  Pure enqueue — returns immediately.  prefetch() already
+ *  dedups (skips cached, skips queued), so this is just a batched loop.   */
+void ExpertPager::prefetch_layer_async(int layer_id, const int* eids, int n)
+{
+    if (layer_id < 0 || layer_id >= num_layers_) return;
+    for (int k = 0; k < n; k++)
+        prefetch(layer_id, eids[k]);
+}
+
+/*  wait_layer_loaded: BARRIER.  Block until every (layer_id, eids[i]) is
+ *  resident in the LRU cache.  Experts that are neither cached nor in-flight
+ *  are queued for the background SSD worker first.  The calling (inference)
+ *  thread NEVER calls pread — it sleeps on loading_cv_ while the worker
+ *  reads from SSD.  After this returns, get() for any of these experts is
+ *  an instant cache hit, so the FFN compute path never stalls on SSD.
+ *
+ *  Locking: cache_mtx_ and queue_mtx_ are taken SEPARATELY (never nested),
+ *  matching the existing get()/prefetch()/worker_loop() discipline.       */
+void ExpertPager::wait_layer_loaded(int layer_id, const int* eids, int n)
+{
+    if (n <= 0) return;
+
+    /* Unique the eids so the residency scan + queue dedup stay small. */
+    std::vector<int> uniq(eids, eids + n);
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
+
+    /* Loop until every expert is resident.  Each pass: classify each expert
+     * (cached / loading / missing), queue the missing ones, then wait for
+     * progress.  Re-queuing on every pass makes the barrier robust to an
+     * expert being EVICTED after it was loaded (rare — a layer's own experts
+     * are MRU during their barrier — but a hang here would be catastrophic, so
+     * we defend against it).  The timed wait bounds the re-queue latency.   */
+    auto all_resident = [&]() {
+        for (int e : uniq)
+            if (!map_.count({layer_id, e})) return false;
+        return true;
+    };
+
+    for (;;) {
+        /* Classify under cache_mtx_, queue missing under queue_mtx_ (locks
+         * taken separately, matching get()/worker_loop discipline).         */
+        std::vector<int> missing;
+        {
+            std::lock_guard<std::mutex> g(cache_mtx_);
+            if (all_resident()) break;
+            for (int e : uniq) {
+                CacheKey key{layer_id, e};
+                if (!map_.count(key) && !loading_.count(key))
+                    missing.push_back(e);
+            }
+        }
+        if (!missing.empty()) {
+            std::lock_guard<std::mutex> qg(queue_mtx_);
+            for (int e : missing) {
+                bool dup = false;
+                for (auto &r : queue_)
+                    if (r.layer == layer_id && r.expert == e) { dup = true; break; }
+                if (!dup) queue_.push_back({layer_id, e});
+            }
+            queue_cv_.notify_all();
+        }
+
+        /* Predicate wait: race-free against the worker's notify (re-checks
+         * residency under cache_mtx_), and the 100 ms timeout wakes us to
+         * re-queue if an expert was evicted (predicate stays false).        */
+        std::unique_lock<std::mutex> g(cache_mtx_);
+        loading_cv_.wait_for(g, std::chrono::milliseconds(100), all_resident);
+        if (all_resident()) break;
+        /* else: timed out with an expert still missing (likely evicted) —
+         * loop, re-classify, re-queue. */
+    }
+
+    /* Account the barrier stall (zero if everything was already resident). */
+    long us = (long)std::chrono::duration_cast<std::chrono::microseconds>(
+                  clock::now() - t0).count();
+    stat_barrier_us_.fetch_add(us, std::memory_order_relaxed);
+    stat_barrier_count_.fetch_add(1, std::memory_order_relaxed);
+    long mx = stat_max_barrier_us_.load(std::memory_order_relaxed);
+    while (us > mx && !stat_max_barrier_us_.compare_exchange_weak(
+                mx, us, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
 /* ── CPU router for draft-driven prefetch ──────────────────────────── */
 void ExpertPager::cpu_router(int* eids, const float* hidden, int n_experts,
                               int top_k, int hd) const

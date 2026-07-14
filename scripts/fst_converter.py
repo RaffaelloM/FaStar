@@ -112,6 +112,8 @@ Q8_0_BLOCK_BYTES = 2 + Q8_0_BLOCK          # fp16 scale + 32 int8
 QTYPE_Q8_0 = 1
 QTYPE_BF16 = 2
 QTYPE_F32 = 3
+QTYPE_MXFP4 = 4   # dense DS4 MXFP4 blocks (1 e8m0 scale + 16 FP4 nibbles / 32 elems)
+                 # stored row-major as [out, in/32, 17]; data_len = out*in/32*17
 
 TID_EMBED = 0
 TID_OUTPUT_NORM = 1
@@ -177,6 +179,39 @@ TID_HY3_NEXTN_EH_PROJ       = 55   # MTP eh_proj         [2*hidden,hidden]    BF
 TID_HY3_NEXTN_ENORM         = 56   # MTP enorm           [hidden]             BF16
 TID_HY3_NEXTN_HNORM         = 57   # MTP hnorm           [hidden]             BF16
 TID_HY3_NEXTN_SHARED_HEAD_N = 58   # MTP shared_head_norm[hidden]             BF16
+
+# ── Qwen3.5-Next (qwen35) specific TIDs ──────────────────────────────────
+# qwen35 is a HYBRID Mamba2-style SSM + GQA dense model: every 4th layer is
+# full attention (L % full_attention_interval == interval-1), the rest are
+# state-space (SSM) layers, plus a final NextN/MTP layer (blk.{n-1}).  No
+# experts (dense).  Large projections are requantized to MXFP4 dense blocks
+# (QTYPE_MXFP4); small precision-sensitive vectors stay F32; RMSNorms BF16.
+# TIDs 5-8 (Q/K/V/O proj) are reused for the full-attention layers; Q35-only
+# tensors get fresh TIDs 60+ so the Q35 engine loader is self-documenting
+# and never collides with a DS4/MLA/HY3 meaning.
+TID_Q35_Q_NORM           = 60   # per-head Q RMSNorm [head_dim=256] F32 (full-attn)
+TID_Q35_K_NORM           = 61   # per-head K RMSNorm [head_dim=256] F32 (full-attn)
+TID_Q35_FFN_GATE         = 62   # dense FFN gate   [inter,hidden] MXFP4 (every layer)
+TID_Q35_FFN_UP           = 63   # dense FFN up     [inter,hidden] MXFP4
+TID_Q35_FFN_DOWN         = 64   # dense FFN down   [hidden,inter] MXFP4
+# ── SSM (Mamba2) block tensors — present on non-full-attention layers ──
+TID_Q35_SSM_QKV          = 65   # fused ssm qkv    [inner+2*?,hidden] MXFP4 (5120->10240)
+TID_Q35_SSM_GATE         = 66   # ssm gate         [inner,hidden]    MXFP4 (5120->6144)
+TID_Q35_SSM_CONV1D       = 67   # conv1d weight    [conv_k, chans]   F32  (4,10240)
+TID_Q35_SSM_A            = 68   # A log            [dt_rank?]        F32  (48,)
+TID_Q35_SSM_ALPHA        = 69   # dt/alpha proj    [out48,hidden]    MXFP4 (5120->48)
+TID_Q35_SSM_BETA         = 70   # dt/beta  proj    [out48,hidden]    MXFP4 (5120->48)
+TID_Q35_SSM_DT_BIAS      = 71   # dt bias          [48]             F32
+TID_Q35_SSM_NORM         = 72   # group norm       [state?]         F32  (128,)
+TID_Q35_SSM_OUT          = 73   # ssm output proj  [hidden,inner]   MXFP4 (6144->5120)
+# ── NextN / MTP head (blk.{n-1}) — attention layer + these extras ──────
+TID_Q35_NEXTN_EH_PROJ    = 74   # MTP eh_proj      [2*hidden,hidden] MXFP4 (10240,5120)
+TID_Q35_NEXTN_ENORM      = 75   # MTP enorm        [hidden]          F32
+TID_Q35_NEXTN_HNORM      = 76   # MTP hnorm        [hidden]          F32
+TID_Q35_NEXTN_HEAD_NORM  = 77   # MTP shared_head_norm [hidden]     F32
+# ── Global config arrays (lid=GLOBAL_LAYER) ─────────────────────────────
+TID_Q35_LAYER_TYPES      = 78   # [n_layers] F32 — 0=SSM, 1=full_attn, 2=MTP
+TID_Q35_CFG              = 79   # [N] F32 — packed qwen35 config blob (see convert_qwen35)
 
 GLOBAL_LAYER = 0xFFFF
 
@@ -311,53 +346,67 @@ def _quantize_dense_block(group_f32):
     return out.tobytes()
 
 
-def _float32_to_dense_blocks(arr_f32):
+def _float32_to_dense_blocks(arr_f32, chunk_rows=512):
     """Convert a float32 [out, in] matrix to dense DS4 blocks.
-    Fully vectorized — no Python loops over elements."""
+
+    Processes the out_dim axis in row-chunks so peak memory is
+    O(chunk_rows * in_dim) instead of O(out_dim * in_dim) — requantizing a
+    5 GB tensor (27B embed/lm_head) then uses ~1.5 GB of intermediates rather
+    than ~15 GB of coexisting copies, which previously OOM'd the converter.
+
+    Bit-identical to the whole-array path: each 32-element block's e8m0 scale
+    depends only on that block's own 32 elements, so splitting along the out
+    (row) axis changes nothing in the output bytes.  Fully vectorized within
+    each chunk — no Python loops over elements."""
     out_dim, in_dim = arr_f32.shape
     num_groups = in_dim // DENSE_BLOCK_ELEMS
+    parts = []
+    for r0 in range(0, out_dim, chunk_rows):
+        r1 = min(r0 + chunk_rows, out_dim)
+        slab = arr_f32[r0:r1]                    # view into the input, no copy
+        # Reshape slab to [r, num_groups, 32] and sanitize
+        blocks = np.nan_to_num(slab.reshape(r1 - r0, num_groups, DENSE_BLOCK_ELEMS),
+                               nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Reshape to [out_dim, num_groups, 32] and sanitize
-    blocks = np.nan_to_num(arr_f32.reshape(out_dim, num_groups, DENSE_BLOCK_ELEMS),
-                            nan=0.0, posinf=0.0, neginf=0.0)
+        # Vectorized e8m0 scale computation
+        abs_max = np.abs(blocks).max(axis=2)     # [r, num_groups]
+        scale_target = abs_max / 4.0
+        safe_target = np.where(scale_target > 0, scale_target, 1.0).astype(np.float32)
+        e_raw = np.ceil(np.log2(safe_target)).astype(np.int32)
+        e_raw = np.clip(e_raw, -127, 127)
+        scale_e8m0 = np.where(abs_max > 0, ((e_raw + 127) & 0xFF).astype(np.uint8), 0)
 
-    # Vectorized e8m0 scale computation
-    abs_max = np.abs(blocks).max(axis=2)  # [out_dim, num_groups]
-    scale_target = abs_max / 4.0
-    safe_target = np.where(scale_target > 0, scale_target, 1.0).astype(np.float32)
-    e_raw = np.ceil(np.log2(safe_target)).astype(np.int32)
-    e_raw = np.clip(e_raw, -127, 127)
-    scale_e8m0 = np.where(abs_max > 0, ((e_raw + 127) & 0xFF).astype(np.uint8), 0)
+        # Convert e8m0 to float for normalization
+        scale_f = np.power(2.0, (scale_e8m0.astype(np.int32) - 127).astype(np.float32))
+        scale_f = np.where(scale_e8m0 > 0, scale_f, np.float32(1e-38))
 
-    # Convert e8m0 to float for normalization
-    scale_f = np.power(2.0, (scale_e8m0.astype(np.int32) - 127).astype(np.float32))
-    scale_f = np.where(scale_e8m0 > 0, scale_f, np.float32(1e-38))
+        # Normalize and quantize to FP4
+        normalized = blocks / scale_f[:, :, None] # [r, num_groups, 32]
+        flat = normalized.reshape(-1, DENSE_BLOCK_ELEMS)
+        abs_flat = np.abs(flat)
 
-    # Normalize and quantize to FP4
-    normalized = blocks / scale_f[:, :, None]  # [out_dim, num_groups, 32]
-    flat = normalized.reshape(-1, DENSE_BLOCK_ELEMS)
-    abs_flat = np.abs(flat)
+        # FP4 quantization via np.select (fastest vectorized approach)
+        conditions = [abs_flat >= 5.0, abs_flat >= 3.5, abs_flat >= 2.5, abs_flat >= 1.75,
+                     abs_flat >= 1.25, abs_flat >= 0.75, abs_flat >= 0.25]
+        choices = [7, 6, 5, 4, 3, 2, 1]
+        idx = np.select(conditions, choices, default=0).astype(np.uint8)
+        nibbles = np.where(flat >= 0, idx, idx + 8).astype(np.uint8)
 
-    # FP4 quantization via np.select (fastest vectorized approach)
-    flat = normalized.reshape(-1, DENSE_BLOCK_ELEMS)
-    abs_flat = np.abs(flat)
-    conditions = [abs_flat >= 5.0, abs_flat >= 3.5, abs_flat >= 2.5, abs_flat >= 1.75,
-                 abs_flat >= 1.25, abs_flat >= 0.75, abs_flat >= 0.25]
-    choices = [7, 6, 5, 4, 3, 2, 1]
-    idx = np.select(conditions, choices, default=0).astype(np.uint8)
-    nibbles = np.where(flat >= 0, idx, idx + 8).astype(np.uint8)
+        # Pack 32 nibbles -> 16 bytes
+        lo = nibbles[:, 0::2]
+        hi = nibbles[:, 1::2]
+        packed = (lo | (hi << 4)).astype(np.uint8)
 
-    # Pack 32 nibbles -> 16 bytes
-    lo = nibbles[:, 0::2]
-    hi = nibbles[:, 1::2]
-    packed = (lo | (hi << 4)).astype(np.uint8)
-
-    # Concatenate scale + packed into [N, 17] and return as bytes
-    scale_col = scale_e8m0.reshape(-1, 1)
-    result = np.empty((scale_col.shape[0], 17), dtype=np.uint8)
-    result[:, 0:1] = scale_col
-    result[:, 1:] = packed
-    return result.tobytes()
+        # Concatenate scale + packed into [N, 17] and append bytes
+        scale_col = scale_e8m0.reshape(-1, 1)
+        result = np.empty((scale_col.shape[0], 17), dtype=np.uint8)
+        result[:, 0:1] = scale_col
+        result[:, 1:] = packed
+        parts.append(result.tobytes())
+        # Drop this chunk's intermediates before the next chunk allocates.
+        del slab, blocks, abs_max, scale_target, safe_target, e_raw, scale_e8m0
+        del scale_f, normalized, flat, abs_flat, idx, nibbles, lo, hi, packed, result
+    return b"".join(parts)
 
 
 # ── Q4_0 quantization (simplified, fully vectorized) ─────────────────
@@ -558,6 +607,15 @@ def _quant_shared(tensor, qtype):
         return _bf16_bytes(tensor)
     if qtype == QTYPE_F32:
         return _to_f32_np(tensor).tobytes()
+    if qtype == QTYPE_MXFP4:
+        # Requantize a [out, in] float weight to dense DS4 MXFP4 blocks
+        # (1 e8m0 scale + 16 FP4 nibbles per 32 elements, row-major).
+        # in_dim must be a multiple of DENSE_BLOCK_ELEMS (32).
+        arr = _to_f32_np(tensor)
+        if arr.ndim != 2 or arr.shape[1] % DENSE_BLOCK_ELEMS != 0:
+            raise ValueError(
+                f"MXFP4 needs 2-D [out,in] with in%32==0, got shape {arr.shape}")
+        return _float32_to_dense_blocks(arr)
     raise ValueError(f"bad qtype {qtype}")
 
 
@@ -1611,6 +1669,14 @@ def _gguf_get(reader, key, default=None):
     if f is None or not f.parts:
         return default
     vt = f.types[-1] if f.types else None
+    # ARRAY field: parts = [pos, name, ARRAY_type, elem_type, nelems, *elems].
+    # The element values are the trailing int/float parts after the 5-part header.
+    if len(f.types) >= 2 and f.types[0] == _g.GGUFValueType.ARRAY:
+        nelems = int(np.asarray(f.parts[4]).ravel()[0])
+        elems = [np.asarray(p).ravel()[0] for p in f.parts[5:5 + nelems]]
+        if vt == _g.GGUFValueType.STRING:
+            return [bytes(e).decode("utf-8", "replace") for e in elems]
+        return np.array(elems)
     arr = f.parts[-1]
     if vt == _g.GGUFValueType.STRING:
         return bytes(arr).decode("utf-8", "replace")
@@ -1831,6 +1897,490 @@ def convert_hy3(gguf_path, output_path, verbose=False):
     print(f"  File size:      {fsize / 1e9:.2f} GB ({fsize:,} bytes)")
     print(f"  Shared entries: {shared_dir_count}")
     print(f"  Expert blocks:  {n_written} (MoE layers 1..{n_blk-1} x {n_exp})")
+    print(f"  Wall time:      {time.time() - t_start:.1f}s")
+    return str(out)
+
+
+# ─── Qwen3.5-Next (qwen35): hybrid SSM + GQA dense, NextN MTP ───────────
+
+
+def _q35_layer_kind(tmap, L):
+    """Authoritative layer type from the tensor inventory (not the cadence rule).
+    Returns 0=SSM, 1=full_attn, 2=MTP. SSM layers carry ssm_conv1d; full-attn
+    layers carry attn_q; the MTP layer carries nextn.eh_proj."""
+    b = f"blk.{L}."
+    if (b + "ssm_conv1d.weight") in tmap:
+        return 0
+    if (b + "nextn.eh_proj.weight") in tmap:
+        return 2
+    if (b + "attn_q.weight") in tmap:
+        return 1
+    raise KeyError(f"blk.{L}: cannot determine layer kind from tensors")
+
+
+def convert_qwen35(gguf_path, output_path, verbose=False):
+    """Convert a Qwen3.5-Next (qwen35) GGUF to a .fst.
+
+    qwen35 is a DENSE hybrid: ~48 Mamba2-style SSM layers + ~16 GQA
+    full-attention layers (every 4th) + 1 NextN/MTP layer.  No experts, so
+    every weight lives in the shared directory.  Large projections
+    (embeddings, lm_head, FFN gate/up/down, attn Q/K/V/O, all SSM
+    projections, eh_proj) are dequantized to F32 and requantized to MXFP4
+    dense blocks (reusing the DS4 expert layout).  RMSNorms -> BF16; small
+    precision-sensitive SSM vectors (A log, dt bias, group norm, conv1d,
+    per-head Q/K norms) -> F32.
+
+    The .fst header keeps its fixed layout (no struct change): num_experts=0,
+    expert_inter_dim slot carries the FFN inter size.  Hybrid/SSM hyperparams
+    that don't fit the fixed header are packed into:
+      - reserved r1: low16=full_attention_interval, high16=nextn_predict_layers
+      - reserved r2: 4×u16 = rope.dimension_sections
+      - a TID_Q35_CFG F32 blob + TID_Q35_LAYER_TYPES F32 array (shared dir)
+    so the Q35 engine loader can reconstruct the full config.
+    """
+    import gguf
+    t_start = time.time()
+    gguf_path = Path(gguf_path)
+
+    print(f"Opening GGUF (mmap): {gguf_path}")
+    reader = gguf.GGUFReader(str(gguf_path))
+    arch = _gguf_get(reader, "general.architecture", "")
+    if arch != "qwen35":
+        raise ValueError(f"not a qwen35 GGUF (general.architecture={arch!r})")
+    n_blk = int(_gguf_get(reader, "qwen35.block_count", 65))
+    tmap = {t.name: t for t in reader.tensors}
+
+    cfg = {
+        "hidden_dim":         int(_gguf_get(reader, "qwen35.embedding_length", 5120)),
+        "num_layers":         n_blk,
+        "num_experts":        0,                          # dense
+        "top_k":              0,
+        "num_q_heads":        int(_gguf_get(reader, "qwen35.attention.head_count", 24)),
+        "num_kv_heads":       int(_gguf_get(reader, "qwen35.attention.head_count_kv", 4)),
+        "head_dim":           int(_gguf_get(reader, "qwen35.attention.key_length", 256)),
+        "expert_inter_dim":   int(_gguf_get(reader, "qwen35.feed_forward_length", 17408)),
+        "num_shared_experts": 0,
+        "vocab_size":         int(tmap["token_embd.weight"].shape[1]),   # [hidden, vocab]
+        "rms_eps":            float(_gguf_get(reader, "qwen35.attention.layer_norm_rms_epsilon", 1e-6)),
+        "rope_freq_base":     float(_gguf_get(reader, "qwen35.rope.freq_base", 1e7)),
+    }
+    full_attn_interval = int(_gguf_get(reader, "qwen35.full_attention_interval", 4))
+    nextn_layers       = int(_gguf_get(reader, "qwen35.nextn_predict_layers", 1))
+    ssm_state   = int(_gguf_get(reader, "qwen35.ssm.state_size", 128))
+    ssm_group   = int(_gguf_get(reader, "qwen35.ssm.group_count", 16))
+    ssm_conv    = int(_gguf_get(reader, "qwen35.ssm.conv_kernel", 4))
+    ssm_dt_rank = int(_gguf_get(reader, "qwen35.ssm.time_step_rank", 48))
+    ssm_inner   = int(_gguf_get(reader, "qwen35.ssm.inner_size", 6144))
+    rope_sec = np.asarray(
+        _gguf_get(reader, "qwen35.rope.dimension_sections", np.array([11, 11, 10, 0])),
+        dtype=np.int64).astype(int).tolist()
+    while len(rope_sec) < 4:
+        rope_sec.append(0)
+
+    # Authoritative per-layer kind from tensors; cross-check the cadence rule.
+    layer_types = [_q35_layer_kind(tmap, L) for L in range(n_blk)]
+    n_ssm  = sum(1 for t in layer_types if t == 0)
+    n_full = sum(1 for t in layer_types if t == 1)
+    n_mtp  = sum(1 for t in layer_types if t == 2)
+    # Sanity: cadence rule predicts full-attn at L % interval == interval-1
+    for L in range(n_blk - 1):  # exclude MTP layer
+        expect = 1 if (full_attn_interval > 0 and L % full_attn_interval == full_attn_interval - 1) else 0
+        if layer_types[L] != expect:
+            print(f"  WARN: blk.{L} kind={layer_types[L]} but cadence rule expects {expect}")
+
+    # Pack the hybrid hints into the reserved header slots (r1/r2).
+    cfg["dspark_block_size"]    = full_attn_interval & 0xFFFF       # r1 low16
+    cfg["dspark_markov_rank"]   = nextn_layers & 0xFFFF             # r1 high16
+    r2 = 0
+    for i, s in enumerate(rope_sec[:4]):
+        r2 |= (int(s) & 0xFFFF) << (16 * i)
+    cfg["dspark_noise_token_id"] = r2                              # r2 = rope sections
+
+    # Full config blob (everything not in the fixed header) for the Q35 loader.
+    cfg_blob = np.array([
+        cfg["hidden_dim"], cfg["num_layers"], cfg["num_q_heads"], cfg["num_kv_heads"],
+        cfg["head_dim"], cfg["expert_inter_dim"], cfg["vocab_size"], cfg["rms_eps"],
+        cfg["rope_freq_base"], full_attn_interval, nextn_layers,
+        ssm_state, ssm_group, ssm_conv, ssm_dt_rank, ssm_inner,
+        rope_sec[0], rope_sec[1], rope_sec[2], rope_sec[3],
+        n_ssm, n_full, n_mtp,
+    ], dtype=np.float32)
+
+    hidden = cfg["hidden_dim"]
+    print(f"qwen35: {n_blk} blocks ({n_ssm} SSM + {n_full} full-attn + {n_mtp} MTP), "
+          f"hidden={hidden}, ffn={cfg['expert_inter_dim']}, "
+          f"GQA {cfg['num_q_heads']}/{cfg['num_kv_heads']} @ {cfg['head_dim']}, "
+          f"vocab={cfg['vocab_size']}")
+    print(f"  SSM: state={ssm_state} group={ssm_group} conv={ssm_conv} "
+          f"dt_rank={ssm_dt_rank} inner={ssm_inner}; full_attn_interval={full_attn_interval}, "
+          f"nextn={nextn_layers}, rope sections={rope_sec}")
+
+    def deq(name):
+        t = tmap.get(name)
+        if t is None:
+            raise KeyError(f"missing GGUF tensor {name!r}")
+        return _gguf_dequant(t)               # [out, in] float32
+
+    # STREAMING: build a list of (tid, lid, sub, qtype, source) specs WITHOUT
+    # materializing any float32 weight yet.  `source` is ("name", <gguf_name>)
+    # to be dequantized lazily in the write loop, or ("array", <ndarray>) for
+    # tiny synthetic tensors (cfg blob, layer types).  This keeps at most ONE
+    # float32 weight resident at a time — the previous eager deq() of all 65
+    # layers at once OOM'd 64 GB RAM (~108 GB of float32 for 27 B params).
+    specs = []
+
+    def add_name(tid, lid, sub, qtype, name):
+        specs.append((tid, lid, sub, qtype, ("name", name)))
+
+    def add_arr(tid, lid, sub, qtype, arr):
+        specs.append((tid, lid, sub, qtype, ("array", arr)))
+
+    # ── Globals ──
+    add_name(TID_EMBED,          GLOBAL_LAYER, 0, QTYPE_MXFP4, "token_embd.weight")
+    add_name(TID_OUTPUT_NORM,    GLOBAL_LAYER, 0, QTYPE_F32,   "output_norm.weight")
+    add_name(TID_LM_HEAD,        GLOBAL_LAYER, 0, QTYPE_MXFP4, "output.weight")
+    add_arr(TID_Q35_LAYER_TYPES, GLOBAL_LAYER, 0, QTYPE_F32,
+            np.asarray(layer_types, dtype=np.float32))
+    add_arr(TID_Q35_CFG,         GLOBAL_LAYER, 0, QTYPE_F32, cfg_blob)
+
+    for L in range(n_blk):
+        b = f"blk.{L}."
+        kind = layer_types[L]
+        # every block: input norm + post-attn norm + dense FFN (gate/up/down)
+        add_name(TID_INPUT_NORM,     L, 0, QTYPE_BF16, b + "attn_norm.weight")
+        add_name(TID_POST_ATTN_NORM, L, 0, QTYPE_BF16, b + "post_attention_norm.weight")
+        add_name(TID_Q35_FFN_GATE,   L, 0, QTYPE_MXFP4, b + "ffn_gate.weight")
+        add_name(TID_Q35_FFN_UP,     L, 0, QTYPE_MXFP4, b + "ffn_up.weight")
+        add_name(TID_Q35_FFN_DOWN,   L, 0, QTYPE_MXFP4, b + "ffn_down.weight")
+
+        if kind == 0:  # SSM (Mamba2) block
+            add_name(TID_Q35_SSM_QKV,     L, 0, QTYPE_MXFP4, b + "attn_qkv.weight")
+            add_name(TID_Q35_SSM_GATE,    L, 0, QTYPE_MXFP4, b + "attn_gate.weight")
+            add_name(TID_Q35_SSM_CONV1D,  L, 0, QTYPE_F32,   b + "ssm_conv1d.weight")
+            add_name(TID_Q35_SSM_A,       L, 0, QTYPE_F32,   b + "ssm_a")
+            add_name(TID_Q35_SSM_ALPHA,   L, 0, QTYPE_MXFP4, b + "ssm_alpha.weight")
+            add_name(TID_Q35_SSM_BETA,    L, 0, QTYPE_MXFP4, b + "ssm_beta.weight")
+            add_name(TID_Q35_SSM_DT_BIAS, L, 0, QTYPE_F32,   b + "ssm_dt.bias")
+            add_name(TID_Q35_SSM_NORM,    L, 0, QTYPE_F32,   b + "ssm_norm.weight")
+            add_name(TID_Q35_SSM_OUT,     L, 0, QTYPE_MXFP4, b + "ssm_out.weight")
+        else:  # full attention (kind 1) or MTP (kind 2): same Q/K/V/O + Q/K norms
+            add_name(TID_Q_PROJ,      L, 0, QTYPE_MXFP4, b + "attn_q.weight")
+            add_name(TID_K_PROJ,      L, 0, QTYPE_MXFP4, b + "attn_k.weight")
+            add_name(TID_V_PROJ,      L, 0, QTYPE_MXFP4, b + "attn_v.weight")
+            add_name(TID_O_PROJ,      L, 0, QTYPE_MXFP4, b + "attn_output.weight")
+            add_name(TID_Q35_Q_NORM,  L, 0, QTYPE_F32,   b + "attn_q_norm.weight")
+            add_name(TID_Q35_K_NORM,  L, 0, QTYPE_F32,   b + "attn_k_norm.weight")
+            if kind == 2:  # MTP/NextN extras
+                add_name(TID_Q35_NEXTN_EH_PROJ,   L, 0, QTYPE_MXFP4, b + "nextn.eh_proj.weight")
+                add_name(TID_Q35_NEXTN_ENORM,     L, 0, QTYPE_F32,   b + "nextn.enorm.weight")
+                add_name(TID_Q35_NEXTN_HNORM,     L, 0, QTYPE_F32,   b + "nextn.hnorm.weight")
+                add_name(TID_Q35_NEXTN_HEAD_NORM, L, 0, QTYPE_F32,   b + "nextn.shared_head_norm.weight")
+
+    print(f"  shared entries: {len(specs)}")
+
+    # ── Write .fst: header reserve -> shared data -> dir (no expert bank) ──
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shared_dir_offset = align_up(HEADER_SIZE)
+    shared_dir_count = len(specs)
+    data_offset = align_up(shared_dir_offset + shared_dir_count * SHARED_ENTRY_SIZE)
+
+    with open(out, "wb") as f:
+        f.write(b"\x00" * data_offset)
+
+        dir_entries = []
+        for i, (tid, lid, sub_id, qtype, source) in enumerate(_tqdm(specs, desc="Shared data")):
+            src_kind, payload = source
+            if src_kind == "name":
+                arr = deq(payload)          # dequantize ONE weight to float32
+            else:
+                arr = payload              # tiny synthetic tensor (cfg / layer types)
+            shape = _shape_of(arr)
+            ndim = len(shape)
+            shape3 = (shape + (1, 1, 1))[:3]
+            data = _quant_shared(arr, qtype)
+            data_off = align_up(f.tell())
+            f.seek(data_off)
+            f.write(data)
+            dir_entries.append(struct.pack(
+                SHARED_ENTRY_FMT,
+                tid, lid, sub_id, qtype, ndim, 0,
+                int(shape3[0]), int(shape3[1]), int(shape3[2]),
+                int(data_off), int(len(data)), 0,
+            ))
+            del arr, data
+            specs[i] = None
+            gc.collect()                    # free the float32 weight before the next tensor
+        del specs
+        gc.collect()
+
+        after_shared = align_up(f.tell())
+        f.seek(shared_dir_offset)
+        f.write(b"".join(dir_entries))
+        del dir_entries
+
+        # No expert bank (dense model). expert_bank_offset = after_shared, 0 experts.
+        f.seek(0, 2)
+        end = align_up(f.tell())
+        f.truncate(end)
+
+        f.seek(0)
+        f.write(_pack_header(
+            cfg, shared_dir_offset, shared_dir_count,
+            after_shared, 0,                       # expert_bank_offset, expert_count_total
+        ))
+
+    fsize = Path(output_path).stat().st_size
+    print(f"\nConversion complete: {output_path}")
+    print(f"  File size:      {fsize / 1e9:.2f} GB ({fsize:,} bytes)")
+    print(f"  Shared entries: {shared_dir_count}  (no expert bank — dense)")
+    print(f"  Wall time:      {time.time() - t_start:.1f}s")
+    return str(out)
+
+
+def convert_qwen35_safetensors(model_dir, output_path, verbose=False):
+    """Convert a Qwen3.5-Next (qwen35) BF16 safetensors snapshot to a .fst.
+
+    Mirrors convert_qwen35 but reads BF16 safetensors directly (single-step
+    BF16 -> MXFP4, avoiding the Q4_K_M -> MXFP4 double quantization that
+    collapses the reasoning model into degenerate loops).  Emits a 64-layer
+    trunk (48 SSM/GDN + 16 GQA) with NO MTP block (n_mtp=0): the engine never
+    runs the MTP layer in generation (trunk = L0..L63), so omitting it avoids
+    the riskier MTP tensor mapping.  Vision tensors (model.visual.*) ignored.
+
+    Key transform vs GGUF: HF stores raw `A_log`; the .fst/engine expect
+    `ssm_a = -exp(A_log)` (precomputed, all-negative) so gdec=exp(ssm_a*sp) is
+    a decay in (0,1).  HF embed_tokens.weight is [vocab,hidden] which already
+    matches the engine's embed_row (row=tid) layout — no transpose.  conv1d
+    is depthwise [CDIM,1,CK] -> squeeze to [CDIM,CK].
+    """
+    t_start = time.time()
+    model_dir = Path(model_dir)
+    snapshot = next((model_dir / "snapshots").iterdir()) \
+        if (model_dir / "snapshots").exists() else model_dir
+    index_path = snapshot / "model.safetensors.index.json"
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index["weight_map"]          # tensor name -> shard filename
+    with open(snapshot / "config.json") as f:
+        cfg_full = json.load(f)
+    tc = cfg_full["text_config"]
+
+    hidden      = int(tc["hidden_size"])      # 5120
+    inter       = int(tc["intermediate_size"])# 17408
+    vocab       = int(tc["vocab_size"])       # 248320
+    n_q         = int(tc["num_attention_heads"])      # 24
+    n_kv        = int(tc["num_key_value_heads"])      # 4
+    head_dim    = int(tc["head_dim"])         # 256
+    eps         = float(tc["rms_norm_eps"])   # 1e-6
+    rope_base   = float(tc["rope_parameters"]["rope_theta"])  # 1e7
+    full_interval = int(tc["full_attention_interval"])        # 4
+    n_trunk     = int(tc["num_hidden_layers"])  # 64 real trunk layers
+    # Emit n_layers = 65 with L64 = MTP (kind 2).  The trunk (L0..L63) is
+    # processed by run_trunk_token; L64 (the NextN/MTP head, from HF mtp.*) is
+    # emitted here and loaded by the engine's kind-2 branch, used by the
+    # speculative-decoding draft path (forward_nextn_step_q35).  ndec = 64 ->
+    # trunk L0..L63 = the 64 real layers; L64 is the MTP head.  Honest
+    # counts: 48 SSM + 16 GQA + 1 MTP.
+    n_layers    = n_trunk + 1
+    n_mtp       = 1
+    ssm_state   = int(tc["linear_value_head_dim"])   # 128
+    ssm_group   = int(tc["linear_num_key_heads"])    # 16
+    ssm_conv    = int(tc["linear_conv_kernel_dim"])  # 4
+    ssm_n_v     = int(tc["linear_num_value_heads"])  # 48
+    ssm_inner   = ssm_n_v * ssm_state                 # 48*128 = 6144
+    ssm_dt_rank = ssm_n_v                             # in_proj_a/b output = 48
+    rope_sec = list(tc["rope_parameters"]["mrope_section"]) + [0, 0, 0, 0]
+    rope_sec = rope_sec[:4]
+
+    # layer_types from config: linear_attention->0 (SSM/GDN), full_attention->1 (GQA)
+    lt_cfg = tc["layer_types"]
+    layer_types = [0 if t == "linear_attention" else 1 for t in lt_cfg[:n_trunk]] + [2]
+    n_ssm  = sum(1 for t in layer_types if t == 0)
+    n_full = sum(1 for t in layer_types if t == 1)
+
+    cfg = {
+        "hidden_dim": hidden, "num_layers": n_layers, "num_experts": 0, "top_k": 0,
+        "num_q_heads": n_q, "num_kv_heads": n_kv, "head_dim": head_dim,
+        "expert_inter_dim": inter, "num_shared_experts": 0, "vocab_size": vocab,
+        "rms_eps": eps, "rope_freq_base": rope_base,
+        "dspark_block_size": full_interval & 0xFFFF,    # r1 low16
+        "dspark_markov_rank": n_mtp & 0xFFFF,           # r1 high16 (=0)
+    }
+    r2 = 0
+    for i, s in enumerate(rope_sec[:4]):
+        r2 |= (int(s) & 0xFFFF) << (16 * i)
+    cfg["dspark_noise_token_id"] = r2
+
+    cfg_blob = np.array([
+        hidden, n_layers, n_q, n_kv, head_dim, inter, vocab, eps, rope_base,
+        full_interval, n_mtp, ssm_state, ssm_group, ssm_conv, ssm_dt_rank, ssm_inner,
+        rope_sec[0], rope_sec[1], rope_sec[2], rope_sec[3],
+        n_ssm, n_full, n_mtp,
+    ], dtype=np.float32)
+
+    print(f"qwen35 BF16: {n_layers} layers ({n_ssm} SSM + {n_full} GQA + {n_mtp} MTP-slot; "
+          f"trunk = L0..{n_trunk-1}), hidden={hidden}, ffn={inter}, "
+          f"GQA {n_q}/{n_kv} @ {head_dim}, vocab={vocab}")
+    print(f"  SSM: state={ssm_state} group={ssm_group} conv={ssm_conv} "
+          f"dt_rank={ssm_dt_rank} inner={ssm_inner}; rope={rope_sec}")
+
+    # shard header cache (15 shards): shard_name -> (hdr, data_start, abs_path)
+    _shard_cache = {}
+    def load_tensor(hf_name):
+        shard = weight_map.get(hf_name)
+        if shard is None:
+            raise KeyError(f"tensor {hf_name!r} not in index")
+        ent = _shard_cache.get(shard)
+        if ent is None:
+            sp = snapshot / shard
+            hdr, ds = _read_safetensors_header(sp)
+            ent = (hdr, ds, sp); _shard_cache[shard] = ent
+        hdr, ds, sp = ent
+        arr = _load_single_tensor_from_shard(sp, hdr, ds, hf_name)
+        if arr is None:
+            raise KeyError(f"{hf_name!r} not in shard {shard}")
+        return np.ascontiguousarray(arr, dtype=np.float32)
+
+    PFX = "model.language_model.layers."
+    def Lname(L, suffix):
+        return f"{PFX}{L}.{suffix}"
+
+    specs = []
+    def add(tid, lid, sub, qtype, hf_name, transform=None):
+        specs.append((tid, lid, sub, qtype, ("name", hf_name, transform)))
+    def add_arr(tid, lid, sub, qtype, arr):
+        specs.append((tid, lid, sub, qtype, ("array", arr)))
+
+    # ── Globals ──
+    # Qwen3.5-Next uses Gemma-style RMSNorm: y = x/rms * (1 + weight).  HF stores
+    # the *delta* (weight); the engine (q35_rmsnorm / rmsnorm_head) multiplies the
+    # stored value DIRECTLY (no +1), so the .fst must hold the full scale = 1+delta.
+    # (Confirmed empirically vs the Q4_K_M GGUF: Q4 norm == HF norm + 1.0 exactly.)
+    # ssm_norm (GDN group norm) is a plain scale, NOT 1+delta — left unchanged.
+    add(TID_EMBED,          GLOBAL_LAYER, 0, QTYPE_MXFP4, "model.language_model.embed_tokens.weight")
+    add(TID_OUTPUT_NORM,    GLOBAL_LAYER, 0, QTYPE_F32,   "model.language_model.norm.weight",
+        transform="add_one")
+    add(TID_LM_HEAD,        GLOBAL_LAYER, 0, QTYPE_MXFP4, "lm_head.weight")
+    add_arr(TID_Q35_LAYER_TYPES, GLOBAL_LAYER, 0, QTYPE_F32, np.asarray(layer_types, dtype=np.float32))
+    add_arr(TID_Q35_CFG,         GLOBAL_LAYER, 0, QTYPE_F32, cfg_blob)
+
+    for L in range(n_trunk):     # emit only L0..L63 (L64 = empty MTP slot)
+        kind = layer_types[L]
+        add(TID_INPUT_NORM,     L, 0, QTYPE_BF16, Lname(L, "input_layernorm.weight"),
+            transform="add_one")
+        add(TID_POST_ATTN_NORM, L, 0, QTYPE_BF16, Lname(L, "post_attention_layernorm.weight"),
+            transform="add_one")
+        add(TID_Q35_FFN_GATE,   L, 0, QTYPE_MXFP4, Lname(L, "mlp.gate_proj.weight"))
+        add(TID_Q35_FFN_UP,     L, 0, QTYPE_MXFP4, Lname(L, "mlp.up_proj.weight"))
+        add(TID_Q35_FFN_DOWN,   L, 0, QTYPE_MXFP4, Lname(L, "mlp.down_proj.weight"))
+        if kind == 0:  # SSM / Gated Delta Net
+            la = f"{PFX}{L}.linear_attn."
+            add(TID_Q35_SSM_QKV,     L, 0, QTYPE_MXFP4, la + "in_proj_qkv.weight")
+            add(TID_Q35_SSM_GATE,    L, 0, QTYPE_MXFP4, la + "in_proj_z.weight")
+            add(TID_Q35_SSM_CONV1D,  L, 0, QTYPE_F32,   la + "conv1d.weight",
+                transform="squeeze_conv1d")
+            add(TID_Q35_SSM_A,       L, 0, QTYPE_F32,   la + "A_log",
+                transform="neg_exp")      # A_log -> ssm_a = -exp(A_log)
+            add(TID_Q35_SSM_ALPHA,   L, 0, QTYPE_MXFP4, la + "in_proj_a.weight")
+            add(TID_Q35_SSM_BETA,    L, 0, QTYPE_MXFP4, la + "in_proj_b.weight")
+            add(TID_Q35_SSM_DT_BIAS, L, 0, QTYPE_F32,   la + "dt_bias")
+            add(TID_Q35_SSM_NORM,    L, 0, QTYPE_F32,   la + "norm.weight")
+            add(TID_Q35_SSM_OUT,     L, 0, QTYPE_MXFP4, la + "out_proj.weight")
+        else:  # full attention (GQA)
+            sa = f"{PFX}{L}.self_attn."
+            add(TID_Q_PROJ,     L, 0, QTYPE_MXFP4, sa + "q_proj.weight")
+            add(TID_K_PROJ,     L, 0, QTYPE_MXFP4, sa + "k_proj.weight")
+            add(TID_V_PROJ,     L, 0, QTYPE_MXFP4, sa + "v_proj.weight")
+            add(TID_O_PROJ,     L, 0, QTYPE_MXFP4, sa + "o_proj.weight")
+            add(TID_Q35_Q_NORM, L, 0, QTYPE_F32,   sa + "q_norm.weight", transform="add_one")
+            add(TID_Q35_K_NORM, L, 0, QTYPE_F32,   sa + "k_norm.weight", transform="add_one")
+
+    # ── L64 = MTP / NextN block (kind 2) from the HF mtp.* keys ──────────────
+    # The trunk loop above emits L0..L63 only (n_trunk = num_hidden_layers = 64).
+    # L64 is the NextN/MTP head: a full GQA+FFN block (mtp.layers.0.*) plus 4
+    # nextn tensors (mtp.fc / pre_fc_norm_{embedding,hidden} / norm).  HF stores
+    # these under a flat "mtp." prefix (NOT model.language_model.layers.64.*).
+    # All MTP norms are Gemma-style RMSNorm (1+delta), same as the trunk -> add_one.
+    # mtp.fc.weight is [hidden, 2*hidden] = [out, in], the natural matvec layout
+    # consumed as-is by fused_mxfp4_matvec_M1 (M=hidden, K=2*hidden) — no transpose.
+    MTP = n_trunk                                # lid 64
+    add(TID_INPUT_NORM,     MTP, 0, QTYPE_BF16, "mtp.layers.0.input_layernorm.weight",
+        transform="add_one")
+    add(TID_POST_ATTN_NORM, MTP, 0, QTYPE_BF16, "mtp.layers.0.post_attention_layernorm.weight",
+        transform="add_one")
+    add(TID_Q35_FFN_GATE,   MTP, 0, QTYPE_MXFP4, "mtp.layers.0.mlp.gate_proj.weight")
+    add(TID_Q35_FFN_UP,     MTP, 0, QTYPE_MXFP4, "mtp.layers.0.mlp.up_proj.weight")
+    add(TID_Q35_FFN_DOWN,   MTP, 0, QTYPE_MXFP4, "mtp.layers.0.mlp.down_proj.weight")
+    msa = "mtp.layers.0.self_attn."
+    add(TID_Q_PROJ,     MTP, 0, QTYPE_MXFP4, msa + "q_proj.weight")
+    add(TID_K_PROJ,     MTP, 0, QTYPE_MXFP4, msa + "k_proj.weight")
+    add(TID_V_PROJ,     MTP, 0, QTYPE_MXFP4, msa + "v_proj.weight")
+    add(TID_O_PROJ,     MTP, 0, QTYPE_MXFP4, msa + "o_proj.weight")
+    add(TID_Q35_Q_NORM, MTP, 0, QTYPE_F32,   msa + "q_norm.weight", transform="add_one")
+    add(TID_Q35_K_NORM, MTP, 0, QTYPE_F32,   msa + "k_norm.weight", transform="add_one")
+    add(TID_Q35_NEXTN_EH_PROJ,   MTP, 0, QTYPE_MXFP4, "mtp.fc.weight")
+    add(TID_Q35_NEXTN_ENORM,     MTP, 0, QTYPE_F32,   "mtp.pre_fc_norm_embedding.weight",
+        transform="add_one")
+    add(TID_Q35_NEXTN_HNORM,     MTP, 0, QTYPE_F32,   "mtp.pre_fc_norm_hidden.weight",
+        transform="add_one")
+    add(TID_Q35_NEXTN_HEAD_NORM, MTP, 0, QTYPE_F32,   "mtp.norm.weight", transform="add_one")
+
+    print(f"  shared entries: {len(specs)}  (incl. L64 MTP block)")
+
+    # ── Write .fst: header reserve -> shared data -> dir (no expert bank) ──
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    shared_dir_offset = align_up(HEADER_SIZE)
+    shared_dir_count = len(specs)
+    data_offset = align_up(shared_dir_offset + shared_dir_count * SHARED_ENTRY_SIZE)
+
+    with open(out, "wb") as f:
+        f.write(b"\x00" * data_offset)
+        dir_entries = []
+        for i, (tid, lid, sub_id, qtype, source) in enumerate(_tqdm(specs, desc="Shared data")):
+            if source[0] == "name":
+                _, hf_name, transform = source
+                arr = load_tensor(hf_name)
+                if transform == "neg_exp":
+                    arr = -np.exp(arr)           # A_log -> ssm_a
+                elif transform == "add_one":
+                    arr = (arr + 1.0).astype(np.float32)   # Gemma-style RMSNorm: store 1+delta
+                elif transform == "squeeze_conv1d":
+                    # depthwise conv1d: HF [CDIM,1,CK] -> [CDIM,CK]; or already [CDIM,CK]
+                    if arr.ndim == 3:
+                        assert arr.shape[1] == 1, f"conv1d not depthwise: shape {arr.shape}"
+                        arr = arr[:, 0, :]
+                    arr = np.ascontiguousarray(arr, dtype=np.float32)
+            else:
+                arr = source[1]                 # tiny synthetic (cfg / layer_types)
+            shape = _shape_of(arr)
+            ndim = len(shape)
+            shape3 = (shape + (1, 1, 1))[:3]
+            data = _quant_shared(arr, qtype)
+            data_off = align_up(f.tell())
+            f.seek(data_off)
+            f.write(data)
+            dir_entries.append(struct.pack(
+                SHARED_ENTRY_FMT, tid, lid, sub_id, qtype, ndim, 0,
+                int(shape3[0]), int(shape3[1]), int(shape3[2]),
+                int(data_off), int(len(data)), 0,
+            ))
+            del arr, data; specs[i] = None; gc.collect()
+        del specs; gc.collect()
+
+        after_shared = align_up(f.tell())
+        f.seek(shared_dir_offset)
+        f.write(b"".join(dir_entries))
+        del dir_entries
+        f.seek(0, 2); end = align_up(f.tell()); f.truncate(end)
+        f.seek(0)
+        f.write(_pack_header(cfg, shared_dir_offset, shared_dir_count, after_shared, 0))
+
+    fsize = Path(output_path).stat().st_size
+    print(f"\nConversion complete: {output_path}")
+    print(f"  File size:      {fsize / 1e9:.2f} GB ({fsize:,} bytes)")
+    print(f"  Shared entries: {shared_dir_count}  (no expert bank — dense; incl. L64 MTP head)")
     print(f"  Wall time:      {time.time() - t_start:.1f}s")
     return str(out)
 
@@ -2513,6 +3063,7 @@ if __name__ == "__main__":
         "  python3 fst_converter.py dspark <model_dir> [main_out] [draft_out]  # DSpark\n"
         "  python3 fst_converter.py draft <model_dir> [output]       # draft only\n"
         "  python3 fst_converter.py hy3 <gguf> [output]              # Hunyuan-3.0 GGUF\n"
+        "  python3 fst_converter.py qwen3 <gguf> [output]            # Qwen3.5-Next GGUF\n"
         "  python3 fst_converter.py verify <fst_file>               # verify .fst\n"
     )
 
@@ -2596,6 +3147,24 @@ if __name__ == "__main__":
         out = sys.argv[3] if len(sys.argv) > 3 else "hy3.fst"
         print(f"=== Converting Hunyuan-3.0 (hy_v3) GGUF -> {out} ===")
         convert_hy3(gguf_path, out, verbose=True)
+        print(f"\n=== Verifying {out} ===")
+        verify_fst(out)
+
+    elif cmd in ("qwen3", "qwen35"):
+        src = sys.argv[2] if len(sys.argv) > 2 else \
+            "Qwopus3.6-27B-Coder-MTP-Q4_K_M.gguf"
+        out = sys.argv[3] if len(sys.argv) > 3 else "qwopus.fst"
+        # Auto-detect: a directory (or path containing model.safetensors.index.json)
+        # -> BF16 safetensors single-step conversion; a .gguf file -> GGUF path.
+        src_path = Path(src)
+        is_st = src_path.is_dir() or src_path.name.endswith(".index.json") or \
+                (src_path.parent / "model.safetensors.index.json").exists()
+        if is_st:
+            print(f"=== Converting Qwen3.5-Next BF16 safetensors -> {out} ===")
+            convert_qwen35_safetensors(src, out, verbose=True)
+        else:
+            print(f"=== Converting Qwen3.5-Next (qwen35) GGUF -> {out} ===")
+            convert_qwen35(src, out, verbose=True)
         print(f"\n=== Verifying {out} ===")
         verify_fst(out)
 

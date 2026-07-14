@@ -139,8 +139,10 @@ struct CompressorState {
  * compression + sqrtsoftplus router + hash routing + DSpark); ARCH_HY3 =
  * Tencent Hunyuan-3.0 (GQA + sigmoid+bias router + dense L0 + always-on
  * shared expert + NextN MTP).  Detected from the FSTH header in the ctor
- * (qh=64 && kh=8 && hd2=128 ⇒ HY3) and unpacked from the reserved r1/r2. */
-enum Arch { ARCH_DS4, ARCH_HY3 };
+ * (qh=64 && kh=8 && hd2=128 ⇒ HY3) and unpacked from the reserved r1/r2.
+ * ARCH_QWEN35 = Qwen3.5-Next hybrid (48 Gated Delta Net SSM + 16 GQA + 1 NextN
+ * MTP), dense, MXFP4 projections; detected by qh=24 && kh=4 && hd2=256. */
+enum Arch { ARCH_DS4, ARCH_HY3, ARCH_QWEN35 };
 
 struct ModelConfig {
     Arch arch = ARCH_DS4;
@@ -150,6 +152,7 @@ struct ModelConfig {
     int hidden_dim = 0;
     int vocab_size = 0;
     int max_seq = 128;
+    float rms_eps = 1e-6f;          /* RMSNorm epsilon (qwen35 1e-6; HY3 hardcodes 1e-5) */
     int rope_dim = MLA_ROPE_DIM;
     size_t expert_block_bytes = 0;
     /* DeepSeek-V4 FFN/router params (from config.json; hardcoded defaults
@@ -182,6 +185,22 @@ struct ModelConfig {
     float expert_weights_scale = 1.0f; /* 2.826 (route_norm × scale) */
     float rope_scaling_factor = 0.0f;  /* 4.0 YaRN */
     int yarn_orig_ctx = 0;          /* 262144 */
+    /* ── Qwen3.5-Next (QWEN35) fields — hybrid SSM+GQA+MTP, dense ──
+     * 65 blocks = 48 SSM (kind 0) + 16 full GQA (kind 1, L%4==3) + 1 MTP (kind 2).
+     * GQA: 24 Q / 4 KV @ head_dim 256.  SSM: 48 v-heads, 16 k-heads, state [128,128]
+     * per v-head (Gated Delta Net, matrix delta-rule).  Unpacked from TID_Q35_CFG
+     * (23 F32) + TID_Q35_LAYER_TYPES ([n_layers] F32) + FSTH r1/r2. */
+    int ssm_state_dim = 0;          /* 128 (HV = state cols = v-head dim) */
+    int ssm_n_vheads = 0;           /* 48 */
+    int ssm_n_kheads = 0;           /* 16 */
+    int ssm_qk_repeat = 3;          /* q/k repeat_interleave 3× (48=16×3) */
+    int ssm_conv_k = 0;             /* 4 (conv1d kernel) */
+    int ssm_inner = 0;              /* 6144 (ssm_qkv inner out) */
+    int ssm_dt_rank = 0;            /* 48 */
+    int full_attn_interval = 4;     /* full-attn layers at L%4==3 */
+    int nextn_predict_layers = 0;   /* MTP depth (r1 high16) */
+    int rope_sections[4] = {0,0,0,0};/* YaRN rope.dimension_sections (r2 4×u16) */
+    std::vector<int> layer_types;   /* [n_layers] 0=SSM 1=full_attn 2=MTP */
 };
 
 /* DSpark draft model config (from .fst header reserved fields) */
@@ -274,6 +293,59 @@ struct Hy3LayerWeights {
     std::vector<bf16_t, AlignedAllocator<bf16_t>> nextn_shared_head_norm; /* [hidden] */
 };
 
+/* ── Qwen3.5-Next (QWEN35) per-layer weights ──────────────────────────────
+ * Dense hybrid (27 B params).  Per layer kind:
+ *   kind 0 (SSM, 48 layers): attn_norm + 9 ssm_* + ffn_norm + ffn_*
+ *   kind 1 (full GQA, 16 layers): attn_norm + q/k/v/o_proj + q_norm/k_norm
+ *                                + ffn_norm + ffn_*
+ *   kind 2 (MTP, 1 layer): kind-1 fields + nextn_eh_proj + 3 nextn norms
+ * MEMORY-FIT: 27 B params as fp32 = ~108 GB ≫ the 35 GB cgroup, so the large
+ * projections (q/k/v/o, ssm_qkv/gate/alpha/beta/out, ffn_*, nextn_eh_proj)
+ * stay as RAW MXFP4 bytes (QTYPE_MXFP4=4, ~0.53 B/elem; whole model ~14.5 GB)
+ * and are dequanted into a reused per-call fp32 scratch on demand.  The small
+ * precision-sensitive tensors (conv1d, A_log, dt_bias, group_norm, q/k_norm,
+ * nextn norms) are F32; attn_norm/ffn_norm are BF16.  Empty vectors on layers
+ * that don't own a tensor.  Stored shapes are [out,in] (MXFP4 block groups run
+ * along in); dims are recomputed from config_ at dequant time. */
+struct Q35LayerWeights {
+    int kind = 0;                   /* 0=SSM 1=full_attn 2=MTP (from TID_Q35_LAYER_TYPES) */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> attn_norm;  /* [hidden] BF16 */
+    std::vector<bf16_t, AlignedAllocator<bf16_t>> ffn_norm;   /* [hidden] BF16 */
+    /* FFN (every layer): dense SwiGLU, raw MXFP4 [out,in] — dequanted to fp32 scratch on demand. */
+    std::vector<uint8_t> ffn_gate;   /* [inter, hidden]   MXFP4 raw */
+    std::vector<uint8_t> ffn_up;     /* [inter, hidden]   MXFP4 raw */
+    std::vector<uint8_t> ffn_down;   /* [hidden, inter]   MXFP4 raw */
+    /* full-attn + MTP (kind 1/2): raw MXFP4. q=[num_q*hd,hidden], k/v=[num_kv*hd,hidden], o=[hidden,num_q*hd] */
+    std::vector<uint8_t> q_proj, k_proj, v_proj, o_proj;
+    std::vector<float> q_norm;       /* [head_dim=256] F32 per-head Q RMSNorm */
+    std::vector<float> k_norm;       /* [head_dim=256] F32 per-head K RMSNorm */
+    /* SSM (kind 0): raw MXFP4 for projections, F32 for the small vectors */
+    std::vector<uint8_t> ssm_qkv;    /* [conv_dim=10240, hidden] MXFP4 raw (q|k|v) */
+    std::vector<uint8_t> ssm_gate;   /* [value_dim=6144, hidden] MXFP4 raw (z gate) */
+    std::vector<float> ssm_conv1d;  /* [conv_k=4, conv_dim=10240] F32 depthwise weight */
+    std::vector<float> ssm_a;        /* [n_vheads=48] F32 (A_log) */
+    std::vector<uint8_t> ssm_alpha;  /* [n_vheads=48, hidden] MXFP4 raw (a) */
+    std::vector<uint8_t> ssm_beta;   /* [n_vheads=48, hidden] MXFP4 raw (b) */
+    std::vector<float> ssm_dt_bias;  /* [n_vheads=48] F32 */
+    std::vector<float> ssm_norm;     /* [head_v_dim=128] F32 group-norm weight (per v-head) */
+    std::vector<uint8_t> ssm_out;    /* [hidden, value_dim=6144] MXFP4 raw */
+    /* MTP (kind 2): raw MXFP4 eh_proj + F32 norms */
+    std::vector<uint8_t> nextn_eh_proj;       /* [2*hidden, hidden] MXFP4 raw */
+    std::vector<float> nextn_enorm;          /* [hidden] F32 */
+    std::vector<float> nextn_hnorm;          /* [hidden] F32 */
+    std::vector<float> nextn_shared_head_norm;/* [hidden] F32 */
+};
+
+/* QWEN35 persistent SSM recurrent state.  Gated Delta Net matrix state
+ * S[n_v_heads, HK, HV] = [48,128,128] fp32 per SSM layer, carried across
+ * tokens (NOT a KV cache — O(1) per token).  Also the depthwise conv1d state
+ * [conv_k, conv_dim] = [4,10240] fp32 (causal conv running buffer).  Reset in
+ * reset_session().  Both empty on non-SSM (kind 1/2) layers. */
+struct Q35SSMState {
+    std::vector<float, AlignedAllocator<float>> S;    /* [n_vheads*HK*HV] row-major */
+    std::vector<float, AlignedAllocator<float>> conv; /* [conv_k*conv_dim] running buffer */
+};
+
 /* Draft model shared weights per stage (mirrors LayerWeightsC but lighter) */
 struct DraftLayerWeights {
     std::vector<bf16_t, AlignedAllocator<bf16_t>> attn_norm, ffn_norm;
@@ -336,6 +408,9 @@ public:
     DraftConfig draft_cfg_;
     std::vector<LayerWeightsC> shared_;
     std::vector<Hy3LayerWeights> hy3_shared_;   /* ARCH_HY3 per-layer GQA+MoE weights */
+    std::vector<Q35LayerWeights> q35_shared_;    /* ARCH_QWEN35 per-layer hybrid weights */
+    std::vector<Q35SSMState>    q35_ssm_state_; /* ARCH_QWEN35 SSM recurrent state [n_vheads*HK*HV]/layer */
+    std::vector<Hy3KVCache>     q35_kv_cache_;  /* ARCH_QWEN35 per-GQA-layer KV cache (kind 1/2 only) */
     ModelWeightsC model_;
     FSTEngine(const std::string& fst_path,size_t cache_mb=6000);
     ~FSTEngine();
@@ -402,6 +477,43 @@ private:
      * → softmax → V → o proj → residual add.  h is [M, hidden] in/out; the
      * attention output is ADDED to h (residual). */
     void process_gqa(int, bf16_t*, int);
+    /* ARCH_QWEN35 hybrid layer dispatch.  SSM layers (kind 0): RMSNorm → ssm_qkv/
+     * ssm_gate proj → conv1d → A_log/alpha/beta → per-head g_logit/beta + l2norm →
+     * Gated Delta Net recurrence (NPU run_blob on fst_gdn_{passA,delta,passB} against
+     * the persistent q35_ssm_state_[lid].S BO) → group norm → ssm_out proj → residual.
+     * Full-attn layers (kind 1): GQA 24Q/4KV @ 256 (variant of process_gqa).  Both
+     * then run the dense SwiGLU FFN (process_ffn_q35).  MTP (kind 2) is driven by
+     * generate_qwen35's nextn step, not process_layer. */
+    void process_ssm(int lid, bf16_t* h, int M);
+    void process_gqa_q35(int lid, bf16_t* h, int M);
+    void process_ffn_q35(int lid, bf16_t* h, int M);
+    /* M=8 SD-verify FFN on the NPU (fst_qwopus_ffn_m8, 16-tile N-split).  Takes 8
+     * contiguous bf16 h-vectors (h8 = MH*hd) + writes MH*hd fp32 post-FFN residuals.
+     * RMSNorm 8 h's -> pack gate/up/down packet BOs -> run_registered_blob dispatch
+     * -> readback -> silu(gate)*up -> down -> residual.  Reuses one 137 MB input BO
+     * across all 3 projections + a 557 KB output BO.  Gate: FST_Q35_FFN_NPU. */
+    void process_ffn_q35_m8_npu(int lid, const bf16_t* h8, float* out_residual);
+    /* Pack+dispatch one M=8 projection (gate/up = up-shape N=17408, down = N=5120).
+     * out_MH_N = MH*N float.  Times pack vs dispatch into the caller's accumulators. */
+    void run_m8_proj(int lid, bool is_down, const float* an, const uint8_t* weight,
+                     float* out_MH_N, double& t_pack, double& t_disp);
+    /* GDN recurrence over all v-heads on the NPU (the bit-correct scan).  Streams
+     * each v-head's persistent S[128,128] through fst_gdn_{passA,delta,passB}
+     * via run_registered_blob; writes the updated S back + per-vhead y.  All
+     * per-vhead tensors are [nV*HV] flat; S is [nV*HV*HV]. */
+    void gdn_scan_vheads(float* S, const float* qn, const float* kn,
+                         const float* v_in, const float* gdec, const float* beta,
+                         float* y_out);
+    /* ARCH_QWEN35 TID-based loader (mirrors load_hy3_shared_weights): reads the
+     * q35 shared dir by TID, dequants MXFP4 projections/FFN to fp32, F32/BF16 for
+     * the small vectors/norms, populates q35_shared_ + model_ globals + config
+     * (layer_types, ssm/rope fields from TID_Q35_CFG / TID_Q35_LAYER_TYPES). */
+    void load_qwen35_shared_weights(const std::string&);
+    /* ARCH_QWEN35 greedy autoregressive path: prefill (SSM layers token-sequential
+     * — recurrence is O(1)-state; full-attn layers chunked) → output_norm → lm_head
+     * → argmax; decode one token/step.  Host-first. */
+    void generate_qwen35(const std::vector<int>&, int, float, float = 0.9f,
+                         void(*)(int,const char*,void*) = nullptr, void* u = nullptr);
     /* ARCH_HY3 FFN: dense SwiGLU for L0 (first_k_dense_replace), MoE+shared for
      * the rest (router → 8 routed experts + always-on shared, residual add). */
     void process_ffn_hy3(int, bf16_t*, int);
@@ -433,6 +545,17 @@ private:
      *     fork-validation step. */
     int  forward_nextn_step(int last_token_id, const bf16_t* h_prev, int step,
                             bf16_t* h_post, float* logits);
+    /* ARCH_QWEN35 NextN MTP head (L64, kind 2 — the mtp.* block the converter
+     * emits at lid=n_layers-1).  Same 6-stage shape as the HY3 NextN step but
+     * using Q35 kernels + storage: embed via q35_embed_raw_ row-dequant;
+     * q35_rmsnorm (Gemma 1+delta, stored value used directly) with F32 nextn
+     * norms; fused mxfp4 matvec for eh_proj [hidden,2*hidden] (HF [out,in]
+     * layout, M=hidden K=2*hidden); process_gqa_q35(64,..)+process_ffn_q35(64,..)
+     * with the MTP's own KV q35_kv_cache_[64]; shared_head_norm (mtp.norm) then
+     * q35_lm_head_ matvec -> argmax draft token.  h_prev is the trunk's
+     * output-norm hidden (post q35_final_norm_) or the prior step's h_post. */
+    int  forward_nextn_step_q35(int last_token_id, const bf16_t* h_prev, int step,
+                                bf16_t* h_post, float* logits);
     /* V4 KV compressor: stream one token's attn-normed hidden through the
      * per-layer compressor state; on a ratio boundary emit a 512-dim
      * compressed KV row into cmp_state_[lid].cache.  NPU projects (qc kernel),
@@ -557,6 +680,59 @@ private:
     int grp_ = 0;
     std::vector<bf16_t> host_embedding_table_;
     std::vector<bf16_t> host_lm_head_;
+    /* ARCH_QWEN35 globals.  embed is raw MXFP4 [vocab,hidden] (row-dequant on
+     * lookup, ~0.67 GB); lm_head is dequanted to fp32 ONCE at load and kept
+     * resident (~5 GB) so the per-token argmax matvec never re-dequants. */
+    std::vector<uint8_t> q35_embed_raw_;          /* [vocab*hidden] MXFP4 blocks */
+    std::vector<float, AlignedAllocator<float>> q35_lm_head_;  /* [vocab*hidden] fp32 */
+    std::vector<float> q35_final_norm_;           /* [hidden] F32 */
+    /* GDN scan dispatch BOs — 3-PASS bit-correct path (fst_gdn_passA/delta/passB).
+     * The fused single-dispatch kernel (fst_gdn_fused.xclbin) has a first-v-head
+     * startup fill-race and is NOT bit-correct; it is reverted out (see
+     * docs/QWOPUS_FUSED_GDN_POSTMORTEM.md).  Three xrt::run per SSM layer
+     * (144 dispatches/token) — slow but bit-correct.  BOs (fp32, reused per call):
+     *   pA_in  : [v][i][130] = [S0[i,0:128]|kn_v[i]|qn_v[i]]            passA in
+     *   pA_out : [v][1024]   = [a(128)|b(128)|pad]                       passA out
+     *   d_in   : [v][642]    = [a|b|v|kn|qn|gdec@640|beta@641]           delta in
+     *   d_out  : [v][1024]   = [delta(128)|y(128)|pad]                   delta out
+     *   pB_in  : 768×2112    = 8 rows × [S0(128)|delta(128)|kn_i|gdec|pad] passB in
+     *   pB_out : 768×1024    = 8 rows × 128 (updated S2)                 passB out
+     * Declared xrt::bo (default-constructible), assigned from xrt::ext::bo at first use. */
+    xrt::bo q35_bo_pA_in_, q35_bo_pA_out_, q35_bo_d_in_, q35_bo_d_out_, q35_bo_pB_in_, q35_bo_pB_out_;
+    bool q35_gdn_bos_ready_ = false;
+    /* GDN FUSED single-dispatch path (fst_gdn_fused.xclbin, 1 xrt::run/SSM-layer =
+     * 48 dispatches/token vs 144).  Gate: FST_Q35_GDN_FUSED=1.
+     * A3 v2 (1 MM2S + 1 S2MM = the bit-correct 3-pass passA channel budget):
+     * fixes both race mechanisms (vh0 2-fill startup race; 2-S2MM drain-flush
+     * cascade) — see docs/QWOPUS_FUSED_GDN_RACE_ROOTCAUSE.md.  BOs fp32, reused
+     * per call, CONTIGUOUS (TAP splits only satisfy BD repeat<=255):
+     *   fused_spkt: [nV*259*136] per v-head: 3 param-pkts + 128 passA + 128 passB
+     *     pkt_v  = [v(128)|gdec@128|beta@129|pad(6)]
+     *     pkt_kn = [kn(128)|pad(8)] ; pkt_qn = [qn(128)|pad(8)]
+     *     row    = [S0(128)|kn_i@128|qn_i@129|gdec@130|pad(5)]
+     *   fused_out: [nV*129*1024] drain order per v-head = [128 S2 rows, 1 y]
+     *     S2[v][i] @ (v*129+i)*1024 (first 128) ; y[v] @ (v*129+128)*1024 + 384 */
+    xrt::bo q35_bo_fused_spkt_, q35_bo_fused_out_;
+    bool q35_gdn_fused_bos_ready_ = false;
+    /* M=8 NPU FFN (fst_qwopus_ffn_m8, gate FST_Q35_FFN_NPU).  ONE input BO (137 MB)
+     * reused across gate/up/down (same PKT=12576 / NPKT=680 / NT=16 geometry; only
+     * N_TILE_USED differs: 1088 up vs 320 down) + ONE output BO (NT*MH*N_TILE_C*4
+     * = 16*8*1088*4 = 557 KB).  Allocated lazily on first dispatch. */
+    xrt::bo q35_ffn_m8_bo_in_, q35_ffn_m8_bo_out_;
+    bool q35_ffn_m8_bos_ready_ = false;
+    /* A/B accumulators (seconds): host-packet-pack vs NPU-dispatch across the
+     * whole 8-token x 64-layer M=8 run, for the packing-fraction report. */
+    double m8_ab_pack_ = 0.0, m8_ab_disp_ = 0.0;
+    /* A/B harness capture (FST_Q35_FFN_NPU): 8 tokens' pre-FFN h (bf16, hd) + the
+     * host post-FFN residual (fp32, hd) per trunk layer, captured during a normal
+     * host decode.  [lid][token] flat. */
+    std::vector<std::vector<bf16_t, AlignedAllocator<bf16_t>>> cap_pre_ffn_;
+    std::vector<std::vector<float, AlignedAllocator<float>>>    cap_post_ffn_host_;
+    int cap_n_ = 0;   /* number of tokens captured (8) */
+    /* M=1 NPU FFN wiring REVERTED (emulated mmul 33ms > 10.7ms OpenMP host +
+     * native -4 register underflow an M=1 argmax cannot tolerate).  Kernel
+     * artifacts (kernels/fst_qwopus_ffn*) + probe kept for the future M=K
+     * speculative-decoding verify path.  See docs/QWOPUS_FFN_NPU_WIRED_POSTMORTEM.md. */
     xrt::bo bo_lm_head_;
     int lm_head_n_pad_ = 131072;  /* vocab padded to a multiple of the 2048 N-tile */
     int seq_pos_=0;
@@ -591,6 +767,7 @@ private:
     // 8*10,027,008 = 80,216,064 B).  Repacked from get_expert_bo each layer.
     xrt::bo bo_fused_weight_;
     bool   hy3_fused_ffn_ = false;   // ctor guard: FST_HY3_FUSED_FFN env set
+    bool   pingpong_       = false;  // ctor guard: FST_HY3_PINGPONG env set (decode SSD/NPU overlap)
 
     // ── 4-set FFN scratch BO pool (async pipeline) ───────────────────────
     // A pool of 4 independent scratch sets so that expert E+1's dequant
@@ -749,6 +926,11 @@ private:
      * is in scope.  Standalone — SD-acceptance wiring lands in the E2E phase. */
     DraftResult forward_nextn_draft(const bf16_t* h_prev, int last_token_id,
                                     int n_max, float p_min);
+    /* ARCH_QWEN35 NextN iterative draft (L64): same shape as forward_nextn_draft
+     * but using the Q35 NextN step (forward_nextn_step_q35) + q35_kv_cache_[64].
+     * Declared after DraftResult so the return type is in scope. */
+    DraftResult forward_nextn_draft_q35(const bf16_t* h_prev, int last_token_id,
+                                        int n_max, float p_min);
 
     /* SD statistics for post-mortem */
     long sd_total_draft_tokens_ = 0;
